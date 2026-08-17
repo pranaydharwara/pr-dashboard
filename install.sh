@@ -58,16 +58,15 @@ EOF
 echo ""
 echo "  ✓ Config saved to config.json"
 
-# macOS app (optional)
+# macOS app
 if [[ "$OSTYPE" == "darwin"* ]]; then
     echo ""
-    read -p "  Create a macOS app for GUI launching? [y/N]: " CREATE_APP
-    if [[ "$CREATE_APP" =~ ^[Yy]$ ]]; then
-        mkdir -p ~/Applications
-        osacompile -o "$HOME/Applications/PR Dashboard.app" \
-            -e "do shell script \"cd '$SCRIPT_DIR' && python3 server.py &\""
-        echo "  ✓ Created ~/Applications/PR Dashboard.app"
-    fi
+    mkdir -p ~/Applications
+    rm -rf "$HOME/Applications/PR Dashboard.app"
+    osacompile -o "$HOME/Applications/PR Dashboard.app" \
+        -e "do shell script \"cd '$SCRIPT_DIR' && python3 server.py &\""
+    echo "  ✓ Created ~/Applications/PR Dashboard.app"
+    echo "    Launch from Spotlight or Dock — no terminal needed."
 fi
 
 echo ""
