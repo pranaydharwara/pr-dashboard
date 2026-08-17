@@ -29,7 +29,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The install script will ask for your repo (e.g. `facebook/react`) and create a `config.json`.
+The install script will ask for your repo (e.g. `facebook/react`), create a `config.json`, and on macOS automatically create a `PR Dashboard.app` in `~/Applications`.
 
 ### Run
 
@@ -64,7 +64,7 @@ PR_DASHBOARD_REPO=facebook/react PR_DASHBOARD_PORT=8080 python3 server.py
 
 ## macOS App
 
-On macOS, the install script can optionally create a `PR Dashboard.app` in `~/Applications` so you can launch it from Spotlight or the Dock without opening a terminal.
+On macOS, the install script automatically creates a `PR Dashboard.app` in `~/Applications` so you can launch it from Spotlight or the Dock without opening a terminal.
 
 ## How It Works
 
