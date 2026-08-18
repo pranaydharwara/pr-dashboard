@@ -9,6 +9,7 @@ A local status page for your GitHub pull requests. Zero dependencies beyond Pyth
 - **My PRs** — all your open PRs with review status, CI, merge state, age, and size
 - **To Review** — PRs where you're personally requested as a reviewer (filters out team-only requests)
 - **Claude Code integration** (macOS) — link PRs to Claude Code sessions and open them with one click
+- **Opt-in notifications** (macOS) — watch individual PRs and get native macOS notifications on state changes
 - Auto-refreshes every 5 minutes
 - Drag-and-drop to prioritize PRs within each section (saved to browser localStorage)
 - Light/dark mode follows your system preference
@@ -103,6 +104,17 @@ On macOS with Claude Desktop installed, you can link each PR to the Claude Code 
 Session titles are read from both Claude Desktop's own metadata and CLI session files, so renamed sessions show their current title. If a linked session can no longer be found, you'll get an error toast instead of accidentally creating a new chat.
 
 Chat link data is stored locally in `chat-links.json` (gitignored).
+
+## Notifications
+
+Notifications are opt-in per PR — no noise by default. Click the bell icon on any PR row to start watching it. A background thread checks every 5 minutes and sends a native macOS notification when:
+
+- **CI fails** — was passing or pending, now failing
+- **CI passes** — was failing, now passing
+- **PR approved** or **changes requested**
+- **Ready to merge** — approved, CI green, and no conflicts
+
+Click the bell again to stop watching. Watch state is stored locally in `watches.json` (gitignored).
 
 ## How It Works
 
