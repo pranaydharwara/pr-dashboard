@@ -58,25 +58,66 @@ EOF
 echo ""
 echo "  ✓ Config saved to config.json"
 
-# macOS app
+# macOS: background service + app
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    echo ""
+    PLIST_LABEL="com.prdashboard.server"
+    PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+    PYTHON3_PATH="$(which python3)"
+
+    # Stop existing service if running
+    launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+
+    # Create launchd agent (auto-starts on login, restarts on crash)
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$PLIST_PATH" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${PYTHON3_PATH}</string>
+        <string>${SCRIPT_DIR}/server.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${SCRIPT_DIR}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${SCRIPT_DIR}/dashboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>${SCRIPT_DIR}/dashboard.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+    # Start the service now
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+    echo "  ✓ Background service installed (starts on login, restarts on crash)"
+
+    # Create macOS app that just opens the browser
     mkdir -p ~/Applications
     rm -rf "$HOME/Applications/PR Dashboard.app"
     osacompile -o "$HOME/Applications/PR Dashboard.app" \
-        -e "do shell script \"cd '$SCRIPT_DIR' && python3 server.py &\""
+        -e "open location \"http://localhost:${PORT}\""
     echo "  ✓ Created ~/Applications/PR Dashboard.app"
-    echo "    Launch from Spotlight or Dock — no terminal needed."
 fi
 
 echo ""
-echo "  Setup complete!"
+echo "  Setup complete! The server is already running."
 echo ""
-echo "  Start the dashboard:"
-echo "    python3 $SCRIPT_DIR/server.py"
+echo "  Open http://localhost:$PORT or launch PR Dashboard from Spotlight."
+echo "  It starts automatically on login — no terminal needed."
 echo ""
-echo "  It will open http://localhost:$PORT in your browser."
-echo "  Auto-refreshes every 5 minutes. Two views:"
-echo "    • My PRs    — your open pull requests"
-echo "    • To Review — PRs where you're personally requested"
+echo "  To stop:  launchctl bootout gui/\$(id -u)/com.prdashboard.server"
+echo "  To start: launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.prdashboard.server.plist"
 echo ""

@@ -29,15 +29,12 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The install script will ask for your repo (e.g. `facebook/react`), create a `config.json`, and on macOS automatically create a `PR Dashboard.app` in `~/Applications`.
+The install script will:
+1. Ask for your repo (e.g. `facebook/react`) and create a `config.json`
+2. On macOS, install a background service that starts on login and restarts on crash
+3. On macOS, create a `PR Dashboard.app` in `~/Applications` for Spotlight/Dock launching
 
-### Run
-
-```bash
-python3 server.py
-```
-
-Opens `http://localhost:9847` in your browser automatically.
+After install, the server is already running — open `http://localhost:9847` or launch the app.
 
 ### Manual config
 
@@ -56,15 +53,47 @@ Edit `config.json`:
 }
 ```
 
+Then run manually:
+
+```bash
+python3 server.py
+```
+
 You can also override config with environment variables:
 
 ```bash
 PR_DASHBOARD_REPO=facebook/react PR_DASHBOARD_PORT=8080 python3 server.py
 ```
 
-## macOS App
+## macOS Background Service
 
-On macOS, the install script automatically creates a `PR Dashboard.app` in `~/Applications` so you can launch it from Spotlight or the Dock without opening a terminal.
+On macOS, the install script sets up a `launchd` agent so the dashboard:
+- **Starts automatically** when you log in
+- **Restarts on crash** — if the process dies, macOS brings it back
+- **Runs silently** in the background with no terminal window
+
+The `PR Dashboard.app` simply opens your browser to the dashboard.
+
+### Managing the service
+
+```bash
+# Stop the server
+launchctl bootout gui/$(id -u)/com.prdashboard.server
+
+# Start the server
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.prdashboard.server.plist
+
+# Check if it's running
+curl -s -o /dev/null -w "%{http_code}" http://localhost:9847
+```
+
+### Non-macOS
+
+On Linux or WSL, run the server directly or add it to your init system:
+
+```bash
+python3 server.py &
+```
 
 ## How It Works
 
