@@ -8,6 +8,7 @@ A local status page for your GitHub pull requests. Zero dependencies beyond Pyth
 
 - **My PRs** — all your open PRs with review status, CI, merge state, age, and size
 - **To Review** — PRs where you're personally requested as a reviewer (filters out team-only requests)
+- **Claude Code integration** (macOS) — link PRs to Claude Code sessions and open them with one click
 - Auto-refreshes every 5 minutes
 - Drag-and-drop to prioritize PRs within each section (saved to browser localStorage)
 - Light/dark mode follows your system preference
@@ -94,6 +95,14 @@ On Linux or WSL, run the server directly or add it to your init system:
 ```bash
 python3 server.py &
 ```
+
+## Claude Code Chat Linking
+
+On macOS with Claude Desktop installed, you can link each PR to the Claude Code session where you worked on it. Click the chat icon on any PR row to search your sessions and pick one. Clicking a linked icon opens Claude Desktop and navigates to that session via Cmd+K.
+
+Session titles are read from both Claude Desktop's own metadata and CLI session files, so renamed sessions show their current title. If a linked session can no longer be found, you'll get an error toast instead of accidentally creating a new chat.
+
+Chat link data is stored locally in `chat-links.json` (gitignored).
 
 ## How It Works
 
