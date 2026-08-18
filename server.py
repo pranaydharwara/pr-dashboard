@@ -8,6 +8,7 @@ import subprocess
 import sys
 import signal
 import socket
+import threading
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -151,6 +152,95 @@ def scan_claude_sessions():
             continue
     sessions.sort(key=lambda s: s["title"].lower())
     return sessions
+
+
+WATCHES_PATH = Path(__file__).parent / "watches.json"
+
+
+def load_watches():
+    if WATCHES_PATH.exists():
+        with open(WATCHES_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_watches(watches):
+    with open(WATCHES_PATH, "w") as f:
+        json.dump(watches, f, indent=2)
+
+
+def send_notification(title, body):
+    script = f'display notification "{body}" with title "{title}"'
+    subprocess.Popen(
+        ["osascript", "-e", script],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _classify_ci(pr):
+    checks = pr.get("statusCheckRollup") or []
+    for c in checks:
+        if c.get("__typename") == "CheckRun" and c.get("conclusion") == "FAILURE":
+            return "failing"
+        if c.get("__typename") == "StatusContext" and c.get("state") == "FAILURE":
+            return "failing"
+    for c in checks:
+        if c.get("__typename") == "CheckRun" and c.get("status") != "COMPLETED":
+            return "pending"
+        if c.get("__typename") == "StatusContext" and c.get("state") == "PENDING":
+            return "pending"
+    return "passing" if checks else "unknown"
+
+
+def _pr_state(pr):
+    return {
+        "ci": _classify_ci(pr),
+        "review": pr.get("reviewDecision", ""),
+        "mergeable": pr.get("mergeable", ""),
+        "title": pr.get("title", ""),
+    }
+
+
+def check_watches():
+    watches = load_watches()
+    if not watches:
+        return
+    prs = fetch_prs() or []
+    review_prs = fetch_review_requests() or []
+    all_prs = {str(pr["number"]): pr for pr in prs + review_prs}
+    changed = False
+    for pr_num, prev in list(watches.items()):
+        pr = all_prs.get(pr_num)
+        if not pr:
+            continue
+        curr = _pr_state(pr)
+        title = curr["title"]
+        short = f"#{pr_num} {title[:50]}"
+        if prev.get("ci") in ("passing", "pending") and curr["ci"] == "failing":
+            send_notification("CI Failed", short)
+        elif prev.get("ci") == "failing" and curr["ci"] == "passing":
+            send_notification("CI Passed", short)
+        if prev.get("review") != "APPROVED" and curr["review"] == "APPROVED":
+            send_notification("PR Approved", short)
+        if prev.get("review") != "CHANGES_REQUESTED" and curr["review"] == "CHANGES_REQUESTED":
+            send_notification("Changes Requested", short)
+        if prev.get("mergeable") != "MERGEABLE" and curr["mergeable"] == "MERGEABLE" \
+                and curr["review"] == "APPROVED" and curr["ci"] == "passing":
+            send_notification("Ready to Merge", short)
+        if curr != {k: prev.get(k) for k in curr}:
+            watches[pr_num] = curr
+            changed = True
+    if changed:
+        save_watches(watches)
+
+
+def _watch_loop():
+    while True:
+        threading.Event().wait(300)
+        try:
+            check_watches()
+        except Exception:
+            pass
 
 
 def fetch_prs():
@@ -394,6 +484,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .chat-link:hover .chat-link-tooltip { display: block; }
 
+  /* Watch bell */
+  .watch-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; border-radius: 6px; cursor: pointer;
+    transition: all 0.15s; border: none; background: none; padding: 0;
+    vertical-align: middle; position: relative;
+  }
+  .watch-btn svg { width: 13px; height: 13px; }
+  .watch-btn.off svg { color: var(--text3); opacity: 0.3; }
+  .watch-btn.off:hover svg { opacity: 0.7; }
+  .watch-btn.on svg { color: var(--yellow); opacity: 0.9; }
+  .watch-btn.on:hover svg { opacity: 1; }
+  .watch-btn .chat-link-tooltip { display: none; position: absolute; bottom: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%); background: var(--text); color: var(--bg);
+    font-size: 10px; font-weight: 500; padding: 4px 8px; border-radius: 6px;
+    white-space: nowrap; z-index: 10; pointer-events: none;
+  }
+  .watch-btn .chat-link-tooltip::after {
+    content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+    border: 4px solid transparent; border-top-color: var(--text);
+  }
+  .watch-btn:hover .chat-link-tooltip { display: block; }
+
   /* Chat link modal */
   .chat-modal-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100;
@@ -580,6 +693,16 @@ function render(prs) {
   const nFailing = prs.filter(p => p._ci === 'failing').length;
   const nDraft = drafts.length;
 
+  function watchBtnHtml(prNum) {
+    const isOn = watchedPrs.has(String(prNum));
+    const cls = isOn ? 'on' : 'off';
+    const tip = isOn ? 'Watching' : 'Watch for changes';
+    const svg = '<svg viewBox="0 0 24 24" fill="' + (isOn ? 'currentColor' : 'none') + '" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>';
+    return `<button class="watch-btn ${cls}" onclick="toggleWatch(event, ${prNum})" title="">
+      ${svg}<span class="chat-link-tooltip">${tip}</span>
+    </button>`;
+  }
+
   function chatLinkHtml(prNum) {
     const link = chatLinks[String(prNum)];
     const svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>';
@@ -601,6 +724,7 @@ function render(prs) {
         <a href="${pr.url}" target="_blank" class="pr-title">${pr.title}</a>
         <div class="pr-meta">
           <span class="pr-number">#${pr.number}</span>
+          ${watchBtnHtml(pr.number)}
           ${chatLinkHtml(pr.number)}
           ${isReviewPage && pr._author ? '<span class="pr-branch">' + pr._author + '</span>' : ''}
           <span class="pr-branch">${branch}</span>
@@ -748,24 +872,6 @@ function saveOrder(section) {
   localStorage.setItem('pr-order-' + section, JSON.stringify(order));
 }
 
-async function refresh() {
-  const info = document.getElementById('refresh-info');
-  const text = document.getElementById('refresh-text');
-  info.classList.add('loading');
-  text.textContent = 'Refreshing...';
-  try {
-    const res = await fetch(isReviewPage ? '/api/review' : '/api/prs');
-    const prs = await res.json();
-    render(prs);
-    const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    text.textContent = `Updated ${now} · next in 5m`;
-    info.classList.remove('loading');
-  } catch (e) {
-    text.textContent = 'Fetch failed — retrying in 5m';
-    info.classList.remove('loading');
-  }
-}
-
 let chatLinks = {};
 
 async function loadChatLinks() {
@@ -773,6 +879,39 @@ async function loadChatLinks() {
     const res = await fetch('/api/chat-links');
     chatLinks = await res.json();
   } catch (e) { chatLinks = {}; }
+}
+
+let watchedPrs = new Set();
+
+async function loadWatches() {
+  try {
+    const res = await fetch('/api/watches');
+    const data = await res.json();
+    watchedPrs = new Set(Object.keys(data));
+  } catch (e) { watchedPrs = new Set(); }
+}
+
+async function toggleWatch(e, prNum) {
+  e.stopPropagation();
+  const key = String(prNum);
+  const action = watchedPrs.has(key) ? 'remove' : 'add';
+  try {
+    await fetch('/api/watches', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pr: key, action}),
+    });
+    if (action === 'add') {
+      watchedPrs.add(key);
+      showToast('Watching #' + prNum);
+    } else {
+      watchedPrs.delete(key);
+      showToast('Unwatched #' + prNum);
+    }
+    refresh();
+  } catch (err) {
+    showToast('Failed to update watch', true);
+  }
 }
 
 function showToast(msg, isError) {
@@ -912,7 +1051,7 @@ async function refresh() {
   info.classList.add('loading');
   text.textContent = 'Refreshing...';
   try {
-    await loadChatLinks();
+    await Promise.all([loadChatLinks(), loadWatches()]);
     const res = await fetch(isReviewPage ? '/api/review' : '/api/prs');
     const prs = await res.json();
     render(prs);
@@ -979,6 +1118,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(scan_claude_sessions())
         elif self.path == "/api/chat-links":
             self._json_response(load_chat_links())
+        elif self.path == "/api/watches":
+            self._json_response(load_watches())
         elif self.path == "/review":
             self._html_response(REVIEW_HTML)
         elif self.path == "/" or self.path == "":
@@ -996,6 +1137,23 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 links[data["pr"]] = {"url": data["url"], "title": data.get("title", "")}
             save_chat_links(links)
+            self._json_response({"ok": True})
+        elif self.path == "/api/watches":
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length))
+            watches = load_watches()
+            pr_num = data["pr"]
+            if data.get("action") == "remove":
+                watches.pop(pr_num, None)
+            else:
+                prs = fetch_prs() or []
+                review_prs = fetch_review_requests() or []
+                pr = next((p for p in prs + review_prs if str(p["number"]) == pr_num), None)
+                if pr:
+                    watches[pr_num] = _pr_state(pr)
+                else:
+                    watches[pr_num] = {}
+            save_watches(watches)
             self._json_response({"ok": True})
         elif self.path == "/api/open-session":
             length = int(self.headers.get("Content-Length", 0))
@@ -1031,6 +1189,9 @@ def main():
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    watcher = threading.Thread(target=_watch_loop, daemon=True)
+    watcher.start()
 
     server = HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"PR Dashboard running at http://localhost:{PORT}")
