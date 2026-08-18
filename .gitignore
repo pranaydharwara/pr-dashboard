@@ -1,4 +1,5 @@
 config.json
+chat-links.json
 dashboard.log
 __pycache__/
 *.pyc

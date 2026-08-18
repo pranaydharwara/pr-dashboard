@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """PR Dashboard — a local status page for your GitHub pull requests."""
 
+import glob
 import json
 import os
 import subprocess
@@ -51,6 +52,105 @@ def get_github_username():
 
 
 GH_USERNAME = get_github_username()
+
+CHAT_LINKS_PATH = Path(__file__).parent / "chat-links.json"
+
+
+def open_claude_session(title):
+    safe_title = title.replace('"', '\\"').replace("'", "'")
+    script = f'''
+    tell application "Claude" to activate
+    delay 0.5
+    tell application "System Events"
+        keystroke "k" using command down
+        delay 0.3
+        keystroke "{safe_title}"
+        delay 0.5
+        key code 125
+        key code 125
+        delay 0.1
+        key code 36
+    end tell
+    '''
+    subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CLAUDE_DESKTOP_SESSIONS_DIR = (
+    Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+)
+
+
+def load_chat_links():
+    if CHAT_LINKS_PATH.exists():
+        with open(CHAT_LINKS_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_chat_links(links):
+    with open(CHAT_LINKS_PATH, "w") as f:
+        json.dump(links, f, indent=2)
+
+
+def _load_desktop_titles():
+    titles = {}
+    if not CLAUDE_DESKTOP_SESSIONS_DIR.exists():
+        return titles
+    for meta_file in glob.glob(str(CLAUDE_DESKTOP_SESSIONS_DIR / "*" / "*" / "local_*.json")):
+        try:
+            with open(meta_file) as f:
+                data = json.load(f)
+            cli_id = data.get("cliSessionId", "")
+            title = data.get("title", "")
+            if cli_id and title:
+                titles[cli_id] = title
+        except (OSError, json.JSONDecodeError):
+            continue
+    return titles
+
+
+def scan_claude_sessions():
+    sessions = []
+    if not CLAUDE_PROJECTS_DIR.exists():
+        return sessions
+    desktop_titles = _load_desktop_titles()
+    for jsonl in glob.glob(str(CLAUDE_PROJECTS_DIR / "*" / "*.jsonl")):
+        path = Path(jsonl)
+        session_id = path.stem
+        if session_id in desktop_titles:
+            sessions.append({
+                "id": session_id,
+                "title": desktop_titles[session_id],
+                "url": f"claude://claude.ai/code/{session_id}",
+            })
+            continue
+        try:
+            ai_title = ""
+            custom_title = ""
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("type") == "ai-title" and not ai_title:
+                        ai_title = data.get("aiTitle", "")
+                    elif data.get("type") == "custom-title":
+                        custom_title = data.get("customTitle", "")
+            title = custom_title or ai_title
+            if title:
+                sessions.append({
+                    "id": session_id,
+                    "title": title,
+                    "url": f"claude://claude.ai/code/{session_id}",
+                })
+        except OSError:
+            continue
+    sessions.sort(key=lambda s: s["title"].lower())
+    return sessions
 
 
 def fetch_prs():
@@ -270,6 +370,74 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .age-stale { color: var(--yellow); }
   .age-old { color: var(--red); }
 
+  /* Chat link */
+  .chat-link {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 20px; height: 20px; border-radius: 6px; cursor: pointer;
+    transition: all 0.15s; border: none; background: none; padding: 0;
+    vertical-align: middle; position: relative;
+  }
+  .chat-link svg { width: 14px; height: 14px; }
+  .chat-link.empty svg { color: var(--text3); opacity: 0.3; }
+  .chat-link.empty:hover svg { opacity: 0.7; }
+  .chat-link.linked svg { color: var(--blue); opacity: 0.8; }
+  .chat-link.linked:hover svg { opacity: 1; }
+  .chat-link-tooltip {
+    display: none; position: absolute; bottom: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%); background: var(--text); color: var(--bg);
+    font-size: 10px; font-weight: 500; padding: 4px 8px; border-radius: 6px;
+    white-space: nowrap; z-index: 10; pointer-events: none;
+  }
+  .chat-link-tooltip::after {
+    content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+    border: 4px solid transparent; border-top-color: var(--text);
+  }
+  .chat-link:hover .chat-link-tooltip { display: block; }
+
+  /* Chat link modal */
+  .chat-modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(2px);
+  }
+  .chat-modal {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 24px; width: 420px; max-width: 90vw; box-shadow: var(--shadow-lg);
+  }
+  .chat-modal h3 {
+    font-size: 15px; font-weight: 700; margin-bottom: 4px;
+  }
+  .chat-modal .modal-subtitle {
+    font-size: 12px; color: var(--text3); margin-bottom: 16px;
+  }
+  .chat-modal input {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 8px; font-size: 13px; background: var(--bg);
+    color: var(--text); outline: none; font-family: inherit;
+  }
+  .chat-modal input:focus { border-color: var(--blue); }
+  .chat-modal input::placeholder { color: var(--text3); }
+  .chat-modal-actions {
+    display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end;
+  }
+  .chat-modal-actions button {
+    padding: 7px 16px; border-radius: 8px; font-size: 12px; font-weight: 600;
+    cursor: pointer; border: 1px solid var(--border); transition: all 0.15s;
+    font-family: inherit;
+  }
+  .btn-cancel { background: var(--bg); color: var(--text2); }
+  .btn-cancel:hover { background: var(--bg-hover); }
+  .btn-save { background: var(--blue); color: white; border-color: var(--blue); }
+  .btn-save:hover { opacity: 0.9; }
+  .btn-remove { background: var(--red-bg); color: var(--red); border-color: var(--red-border); }
+  .btn-remove:hover { opacity: 0.9; }
+  .session-item {
+    padding: 10px 12px; border-radius: 8px; transition: background 0.1s;
+    border-bottom: 1px solid var(--border);
+  }
+  .session-item:last-child { border-bottom: none; }
+  .session-item:hover { background: var(--bg-hover); }
+
   /* Drag handle */
   .drag-handle {
     cursor: grab; color: var(--text3); font-size: 14px; user-select: none;
@@ -412,6 +580,19 @@ function render(prs) {
   const nFailing = prs.filter(p => p._ci === 'failing').length;
   const nDraft = drafts.length;
 
+  function chatLinkHtml(prNum) {
+    const link = chatLinks[String(prNum)];
+    const svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>';
+    if (link) {
+      return `<button class="chat-link linked" onclick="handleChatLink(event, ${prNum})" title="">
+        ${svg}<span class="chat-link-tooltip">${link.title || 'Open chat'}</span>
+      </button>`;
+    }
+    return `<button class="chat-link empty" onclick="handleChatLink(event, ${prNum})" title="">
+      ${svg}<span class="chat-link-tooltip">Link a chat</span>
+    </button>`;
+  }
+
   function row(pr, section) {
     const branch = pr.headRefName || '';
     return `<tr draggable="true" data-pr="${pr.number}" data-section="${section}">
@@ -420,6 +601,7 @@ function render(prs) {
         <a href="${pr.url}" target="_blank" class="pr-title">${pr.title}</a>
         <div class="pr-meta">
           <span class="pr-number">#${pr.number}</span>
+          ${chatLinkHtml(pr.number)}
           ${isReviewPage && pr._author ? '<span class="pr-branch">' + pr._author + '</span>' : ''}
           <span class="pr-branch">${branch}</span>
         </div>
@@ -584,6 +766,165 @@ async function refresh() {
   }
 }
 
+let chatLinks = {};
+
+async function loadChatLinks() {
+  try {
+    const res = await fetch('/api/chat-links');
+    chatLinks = await res.json();
+  } catch (e) { chatLinks = {}; }
+}
+
+function showToast(msg, isError) {
+  const t = document.createElement('div');
+  t.textContent = msg;
+  Object.assign(t.style, {
+    position: 'fixed', bottom: '20px', left: '50%', transform: 'translateX(-50%)',
+    padding: '10px 20px', borderRadius: '8px', fontSize: '14px', zIndex: '10000',
+    color: '#fff', background: isError ? '#e74c3c' : '#27ae60',
+    boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+  });
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+function handleChatLink(e, prNum) {
+  e.stopPropagation();
+  const link = chatLinks[String(prNum)];
+  if (link && !e.shiftKey) {
+    if (link.url && link.url.startsWith('claude://claude.ai/code/')) {
+      fetch('/api/open-session', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({title: link.title}),
+      }).then(r => r.json()).then(d => {
+        if (!d.ok) showToast(d.error || 'Failed to open session', true);
+      });
+      return;
+    }
+    window.open(link.url, '_blank');
+    return;
+  }
+  showChatModal(prNum, link);
+}
+
+async function showChatModal(prNum, existing) {
+  let sessions = [];
+  try {
+    const res = await fetch('/api/sessions');
+    sessions = await res.json();
+  } catch (e) {}
+
+  const overlay = document.createElement('div');
+  overlay.className = 'chat-modal-overlay';
+  overlay.innerHTML = `
+    <div class="chat-modal">
+      <h3>${existing ? 'Edit' : 'Link'} chat for #${prNum}</h3>
+      <div class="modal-subtitle">Search your Claude Code sessions or paste any URL</div>
+      <input type="text" id="chat-search" placeholder="Search sessions or paste a URL..." value="" autocomplete="off">
+      <div id="session-list" style="max-height:240px;overflow-y:auto;margin-top:8px;"></div>
+      <div class="chat-modal-actions">
+        ${existing ? '<button class="btn-remove" id="chat-remove">Remove</button>' : ''}
+        <button class="btn-cancel" id="chat-cancel">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const input = document.getElementById('chat-search');
+  const list = document.getElementById('session-list');
+
+  function renderSessions(query) {
+    const q = query.toLowerCase().trim();
+    const filtered = q ? sessions.filter(s => s.title.toLowerCase().includes(q)) : sessions.slice(0, 15);
+    if (!filtered.length && !q) {
+      list.innerHTML = '<div style="padding:12px;font-size:12px;color:var(--text3);">No Claude Code sessions found</div>';
+      return;
+    }
+    if (!filtered.length) {
+      const isUrl = q.startsWith('http') || q.startsWith('claude://');
+      list.innerHTML = isUrl
+        ? `<div class="session-item" data-url="${q}" data-title="Custom link" style="cursor:pointer;">
+            <div style="font-size:12px;font-weight:600;">Save as custom link</div>
+            <div style="font-size:11px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${q}</div>
+          </div>`
+        : '<div style="padding:12px;font-size:12px;color:var(--text3);">No matching sessions</div>';
+      return;
+    }
+    list.innerHTML = filtered.map(s => `
+      <div class="session-item" data-url="${s.url}" data-title="${s.title.replace(/"/g, '&quot;')}" style="cursor:pointer;">
+        <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${s.title}</div>
+        <div style="font-size:10px;color:var(--text3);font-family:monospace;">${s.id.slice(0, 8)}...</div>
+      </div>
+    `).join('');
+  }
+
+  renderSessions('');
+  input.focus();
+
+  input.addEventListener('input', () => renderSessions(input.value));
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Escape') overlay.remove();
+    if (e.key === 'Enter') {
+      const val = input.value.trim();
+      if (val.startsWith('http') || val.startsWith('claude://')) {
+        saveChatLink(prNum, val, 'Custom link');
+        overlay.remove();
+      }
+    }
+  });
+
+  list.addEventListener('click', e => {
+    const item = e.target.closest('.session-item');
+    if (!item) return;
+    saveChatLink(prNum, item.dataset.url, item.dataset.title);
+    overlay.remove();
+  });
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.getElementById('chat-cancel').onclick = () => overlay.remove();
+  if (existing) {
+    document.getElementById('chat-remove').onclick = async () => {
+      await fetch('/api/chat-links', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({pr: String(prNum), action: 'remove'}),
+      });
+      await loadChatLinks();
+      overlay.remove();
+      refresh();
+    };
+  }
+}
+
+async function saveChatLink(prNum, url, title) {
+  await fetch('/api/chat-links', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pr: String(prNum), url, title}),
+  });
+  await loadChatLinks();
+  refresh();
+}
+
+async function refresh() {
+  const info = document.getElementById('refresh-info');
+  const text = document.getElementById('refresh-text');
+  info.classList.add('loading');
+  text.textContent = 'Refreshing...';
+  try {
+    await loadChatLinks();
+    const res = await fetch(isReviewPage ? '/api/review' : '/api/prs');
+    const prs = await res.json();
+    render(prs);
+    const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    text.textContent = `Updated ${now} · next in 5m`;
+    info.classList.remove('loading');
+  } catch (e) {
+    text.textContent = 'Fetch failed — retrying in 5m';
+    info.classList.remove('loading');
+  }
+}
+
 refresh();
 setInterval(refresh, REFRESH_INTERVAL);
 </script>
@@ -613,37 +954,63 @@ REVIEW_HTML = build_review_html()
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _json_response(self, data):
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html_response(self, html):
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path == "/api/prs":
-            prs = fetch_prs()
-            body = json.dumps(prs or []).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self._json_response(fetch_prs() or [])
         elif self.path == "/api/review":
-            prs = fetch_review_requests()
-            body = json.dumps(prs or []).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self._json_response(fetch_review_requests() or [])
+        elif self.path == "/api/sessions":
+            self._json_response(scan_claude_sessions())
+        elif self.path == "/api/chat-links":
+            self._json_response(load_chat_links())
         elif self.path == "/review":
-            body = REVIEW_HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self._html_response(REVIEW_HTML)
         elif self.path == "/" or self.path == "":
-            body = DASHBOARD_HTML.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            self._html_response(DASHBOARD_HTML)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/api/chat-links":
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length))
+            links = load_chat_links()
+            if data.get("action") == "remove":
+                links.pop(data["pr"], None)
+            else:
+                links[data["pr"]] = {"url": data["url"], "title": data.get("title", "")}
+            save_chat_links(links)
+            self._json_response({"ok": True})
+        elif self.path == "/api/open-session":
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length))
+            title = data.get("title", "")
+            if not title:
+                self._json_response({"ok": False, "error": "No title provided"})
+                return
+            sessions = scan_claude_sessions()
+            match = any(s["title"].lower() == title.lower() for s in sessions)
+            if not match:
+                self._json_response({"ok": False, "error": f"Session \"{title}\" not found"})
+                return
+            open_claude_session(title)
+            self._json_response({"ok": True})
         else:
             self.send_error(404)
 
