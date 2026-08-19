@@ -99,13 +99,18 @@ python3 server.py &
 
 ## Cursor Chat Linking
 
-On macOS with [Cursor](https://cursor.com) installed, you can link each PR to the Cursor chat where you worked on it. Click the chat icon on any PR row to search your Cursor chats and pick one. Clicking a linked icon focuses Cursor on that chat's workspace and opens the Cmd+K conversation search pre-filled with the chat title.
+On macOS with [Cursor](https://cursor.com) installed, you can link each PR to the Cursor chat where you worked on it. Click the chat icon on any PR row to search your Cursor chats and pick one. Clicking a linked icon activates Cursor, opens the Cmd+K conversation search, types the chat title, and hits Enter to jump into the top match. Shift-click to edit or remove a link.
+
+Cursor has no official "open this chat" URL scheme yet, so the reopen step drives Cmd+K search via AppleScript. Two setup notes:
+
+- **Cmd+K only searches chats inside the Agents Window.** In the classic editor window, Cmd+K opens the inline-edit prompt instead, and the title gets typed there. Open the Agents Window once (Cmd+Shift+P → "Open Agents Window") and keep it around — after that the flow works.
+- **Grant Accessibility permissions.** System Settings → Privacy & Security → Accessibility → enable your terminal / launchd / Cursor so `osascript` can send the keystrokes.
 
 Chat titles come from Cursor's local index (`state.vscdb` + `conversation-search.db` under `~/Library/Application Support/Cursor/User/globalStorage/`). The dashboard reads them read-only — nothing is written to Cursor's data. If a linked chat can no longer be found, you'll get an error toast instead of quietly landing in an unrelated chat.
 
-Cursor has no official "open this chat" URL scheme yet, so the last step relies on Cmd+K search — make sure Accessibility permissions are granted so AppleScript can send the keystrokes.
+The modal search also matches on workspace path, so typing a repo folder name narrows results to chats you had inside that project.
 
-Chat link data is stored locally in `chat-links.json` (gitignored). You can also paste any `http(s)://` URL into the modal to save a custom link.
+Chat link data is stored locally in `chat-links.json` (gitignored). You can also paste any `http(s)://` URL into the modal to save a custom link — handy for pointing a PR at a doc, ticket, or shared Cursor transcript URL.
 
 ## Notifications
 
