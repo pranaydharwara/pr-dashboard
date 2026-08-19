@@ -8,7 +8,7 @@ A local status page for your GitHub pull requests. Zero dependencies beyond Pyth
 
 - **My PRs** — all your open PRs with review status, CI, merge state, age, and size
 - **To Review** — PRs where you're personally requested as a reviewer (filters out team-only requests)
-- **Claude Code integration** (macOS) — link PRs to Claude Code sessions and open them with one click
+- **Cursor chat integration** (macOS) — link PRs to Cursor chats and reopen them with one click
 - **Opt-in notifications** (macOS) — watch individual PRs and get native macOS notifications on state changes
 - Auto-refreshes every 5 minutes
 - Drag-and-drop to prioritize PRs within each section (saved to browser localStorage)
@@ -97,13 +97,15 @@ On Linux or WSL, run the server directly or add it to your init system:
 python3 server.py &
 ```
 
-## Claude Code Chat Linking
+## Cursor Chat Linking
 
-On macOS with Claude Desktop installed, you can link each PR to the Claude Code session where you worked on it. Click the chat icon on any PR row to search your sessions and pick one. Clicking a linked icon opens Claude Desktop and navigates to that session via Cmd+K.
+On macOS with [Cursor](https://cursor.com) installed, you can link each PR to the Cursor chat where you worked on it. Click the chat icon on any PR row to search your Cursor chats and pick one. Clicking a linked icon focuses Cursor on that chat's workspace and opens the Cmd+K conversation search pre-filled with the chat title.
 
-Session titles are read from both Claude Desktop's own metadata and CLI session files, so renamed sessions show their current title. If a linked session can no longer be found, you'll get an error toast instead of accidentally creating a new chat.
+Chat titles come from Cursor's local index (`state.vscdb` + `conversation-search.db` under `~/Library/Application Support/Cursor/User/globalStorage/`). The dashboard reads them read-only — nothing is written to Cursor's data. If a linked chat can no longer be found, you'll get an error toast instead of quietly landing in an unrelated chat.
 
-Chat link data is stored locally in `chat-links.json` (gitignored).
+Cursor has no official "open this chat" URL scheme yet, so the last step relies on Cmd+K search — make sure Accessibility permissions are granted so AppleScript can send the keystrokes.
+
+Chat link data is stored locally in `chat-links.json` (gitignored). You can also paste any `http(s)://` URL into the modal to save a custom link.
 
 ## Notifications
 

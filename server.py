@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """PR Dashboard — a local status page for your GitHub pull requests."""
 
-import glob
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import signal
@@ -57,28 +57,36 @@ GH_USERNAME = get_github_username()
 CHAT_LINKS_PATH = Path(__file__).parent / "chat-links.json"
 
 
-def open_claude_session(title):
-    safe_title = title.replace('"', '\\"').replace("'", "'")
+def _cursor_global_storage_dir():
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage"
+    if sys.platform.startswith("win"):
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "Cursor" / "User" / "globalStorage"
+        return home / "AppData" / "Roaming" / "Cursor" / "User" / "globalStorage"
+    return home / ".config" / "Cursor" / "User" / "globalStorage"
+
+
+CURSOR_STATE_DB = _cursor_global_storage_dir() / "state.vscdb"
+CURSOR_SEARCH_DB = _cursor_global_storage_dir() / "conversation-search.db"
+
+
+def open_cursor_session(title):
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
-    tell application "Claude" to activate
+    tell application "Cursor" to activate
     delay 0.5
     tell application "System Events"
         keystroke "k" using command down
         delay 0.3
         keystroke "{safe_title}"
-        delay 0.5
-        key code 125
-        key code 125
-        delay 0.1
+        delay 0.3
         key code 36
     end tell
     '''
     subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-CLAUDE_DESKTOP_SESSIONS_DIR = (
-    Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
-)
 
 
 def load_chat_links():
@@ -93,64 +101,102 @@ def save_chat_links(links):
         json.dump(links, f, indent=2)
 
 
-def _load_desktop_titles():
-    titles = {}
-    if not CLAUDE_DESKTOP_SESSIONS_DIR.exists():
-        return titles
-    for meta_file in glob.glob(str(CLAUDE_DESKTOP_SESSIONS_DIR / "*" / "*" / "local_*.json")):
+def _ro_connect(path):
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+
+
+def _cursor_header_index():
+    index = {}
+    if not CURSOR_STATE_DB.exists():
+        return index
+    try:
+        con = _ro_connect(CURSOR_STATE_DB)
+    except sqlite3.Error:
+        return index
+    try:
+        cur = con.cursor()
         try:
-            with open(meta_file) as f:
-                data = json.load(f)
-            cli_id = data.get("cliSessionId", "")
-            title = data.get("title", "")
-            if cli_id and title:
-                titles[cli_id] = title
-        except (OSError, json.JSONDecodeError):
-            continue
-    return titles
+            rows = cur.execute(
+                "SELECT composerId, isArchived, isSubagent, recency, value FROM composerHeaders"
+            ).fetchall()
+        except sqlite3.Error:
+            return index
+        for cid, archived, subagent, recency, value in rows:
+            if archived or subagent:
+                continue
+            try:
+                data = json.loads(value) if value else {}
+            except (TypeError, ValueError):
+                data = {}
+            if data.get("isArchived") or data.get("isSubagent"):
+                continue
+            if data.get("isDraft") or data.get("isBestOfNSubcomposer"):
+                continue
+            ws = data.get("workspaceIdentifier") or {}
+            uri = ws.get("uri") or {}
+            workspace_path = uri.get("fsPath") or uri.get("path")
+            name = (data.get("name") or "").strip()
+            index[cid] = {
+                "name": name,
+                "workspace": workspace_path,
+                "recency": recency or data.get("lastUpdatedAt") or data.get("createdAt") or 0,
+            }
+    finally:
+        con.close()
+    return index
 
 
-def scan_claude_sessions():
+def scan_cursor_sessions():
+    headers = _cursor_header_index()
     sessions = []
-    if not CLAUDE_PROJECTS_DIR.exists():
-        return sessions
-    desktop_titles = _load_desktop_titles()
-    for jsonl in glob.glob(str(CLAUDE_PROJECTS_DIR / "*" / "*.jsonl")):
-        path = Path(jsonl)
-        session_id = path.stem
-        if session_id in desktop_titles:
-            sessions.append({
-                "id": session_id,
-                "title": desktop_titles[session_id],
-                "url": f"claude://claude.ai/code/{session_id}",
-            })
-            continue
+    seen = set()
+
+    if CURSOR_SEARCH_DB.exists():
         try:
-            ai_title = ""
-            custom_title = ""
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+            con = _ro_connect(CURSOR_SEARCH_DB)
+        except sqlite3.Error:
+            con = None
+        if con is not None:
+            try:
+                cur = con.cursor()
+                try:
+                    rows = cur.execute(
+                        "SELECT id, title, updated_at FROM conversations "
+                        "WHERE COALESCE(is_archived, 0) = 0 AND title != '' "
+                        "ORDER BY updated_at DESC"
+                    ).fetchall()
+                except sqlite3.Error:
+                    rows = []
+                for cid, title, updated_at in rows:
+                    if not cid or not title:
                         continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if data.get("type") == "ai-title" and not ai_title:
-                        ai_title = data.get("aiTitle", "")
-                    elif data.get("type") == "custom-title":
-                        custom_title = data.get("customTitle", "")
-            title = custom_title or ai_title
-            if title:
-                sessions.append({
-                    "id": session_id,
-                    "title": title,
-                    "url": f"claude://claude.ai/code/{session_id}",
-                })
-        except OSError:
+                    header = headers.get(cid, {})
+                    sessions.append({
+                        "id": cid,
+                        "title": title,
+                        "workspace": header.get("workspace"),
+                        "url": f"cursor://session/{cid}",
+                        "recency": header.get("recency") or updated_at or 0,
+                    })
+                    seen.add(cid)
+            finally:
+                con.close()
+
+    for cid, header in headers.items():
+        if cid in seen:
             continue
-    sessions.sort(key=lambda s: s["title"].lower())
+        name = header.get("name") or ""
+        if not name:
+            continue
+        sessions.append({
+            "id": cid,
+            "title": name,
+            "workspace": header.get("workspace"),
+            "url": f"cursor://session/{cid}",
+            "recency": header.get("recency") or 0,
+        })
+
+    sessions.sort(key=lambda s: s.get("recency") or 0, reverse=True)
     return sessions
 
 
@@ -931,13 +977,13 @@ function handleChatLink(e, prNum) {
   e.stopPropagation();
   const link = chatLinks[String(prNum)];
   if (link && !e.shiftKey) {
-    if (link.url && link.url.startsWith('claude://claude.ai/code/')) {
+    if (link.url && link.url.startsWith('cursor://session/')) {
       fetch('/api/open-session', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({title: link.title}),
+        body: JSON.stringify({id: link.id || '', title: link.title}),
       }).then(r => r.json()).then(d => {
-        if (!d.ok) showToast(d.error || 'Failed to open session', true);
+        if (!d.ok) showToast(d.error || 'Failed to open chat', true);
       });
       return;
     }
@@ -959,8 +1005,8 @@ async function showChatModal(prNum, existing) {
   overlay.innerHTML = `
     <div class="chat-modal">
       <h3>${existing ? 'Edit' : 'Link'} chat for #${prNum}</h3>
-      <div class="modal-subtitle">Search your Claude Code sessions or paste any URL</div>
-      <input type="text" id="chat-search" placeholder="Search sessions or paste a URL..." value="" autocomplete="off">
+      <div class="modal-subtitle">Search your Cursor chats or paste any URL</div>
+      <input type="text" id="chat-search" placeholder="Search chats or paste a URL..." value="" autocomplete="off">
       <div id="session-list" style="max-height:240px;overflow-y:auto;margin-top:8px;"></div>
       <div class="chat-modal-actions">
         ${existing ? '<button class="btn-remove" id="chat-remove">Remove</button>' : ''}
@@ -972,29 +1018,43 @@ async function showChatModal(prNum, existing) {
   const input = document.getElementById('chat-search');
   const list = document.getElementById('session-list');
 
+  const esc = s => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const wsName = s => {
+    if (!s.workspace) return '';
+    const parts = String(s.workspace).split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : '';
+  };
+
   function renderSessions(query) {
     const q = query.toLowerCase().trim();
-    const filtered = q ? sessions.filter(s => s.title.toLowerCase().includes(q)) : sessions.slice(0, 15);
+    const filtered = q
+      ? sessions.filter(s => s.title.toLowerCase().includes(q) || (s.workspace || '').toLowerCase().includes(q))
+      : sessions.slice(0, 15);
     if (!filtered.length && !q) {
-      list.innerHTML = '<div style="padding:12px;font-size:12px;color:var(--text3);">No Claude Code sessions found</div>';
+      list.innerHTML = '<div style="padding:12px;font-size:12px;color:var(--text3);">No Cursor chats found</div>';
       return;
     }
     if (!filtered.length) {
-      const isUrl = q.startsWith('http') || q.startsWith('claude://');
+      const isUrl = q.startsWith('http');
       list.innerHTML = isUrl
-        ? `<div class="session-item" data-url="${q}" data-title="Custom link" style="cursor:pointer;">
+        ? `<div class="session-item" data-url="${esc(q)}" data-title="Custom link" style="cursor:pointer;">
             <div style="font-size:12px;font-weight:600;">Save as custom link</div>
-            <div style="font-size:11px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${q}</div>
+            <div style="font-size:11px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(q)}</div>
           </div>`
-        : '<div style="padding:12px;font-size:12px;color:var(--text3);">No matching sessions</div>';
+        : '<div style="padding:12px;font-size:12px;color:var(--text3);">No matching chats</div>';
       return;
     }
-    list.innerHTML = filtered.map(s => `
-      <div class="session-item" data-url="${s.url}" data-title="${s.title.replace(/"/g, '&quot;')}" style="cursor:pointer;">
-        <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${s.title}</div>
-        <div style="font-size:10px;color:var(--text3);font-family:monospace;">${s.id.slice(0, 8)}...</div>
-      </div>
-    `).join('');
+    list.innerHTML = filtered.map(s => {
+      const ws = wsName(s);
+      const meta = ws ? `${ws} · ${s.id.slice(0, 8)}` : `${s.id.slice(0, 8)}`;
+      return `
+        <div class="session-item" data-id="${esc(s.id)}" data-url="${esc(s.url)}" data-title="${esc(s.title)}" style="cursor:pointer;">
+          <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${esc(s.title)}</div>
+          <div style="font-size:10px;color:var(--text3);font-family:monospace;">${esc(meta)}</div>
+        </div>`;
+    }).join('');
   }
 
   renderSessions('');
@@ -1005,8 +1065,8 @@ async function showChatModal(prNum, existing) {
     if (e.key === 'Escape') overlay.remove();
     if (e.key === 'Enter') {
       const val = input.value.trim();
-      if (val.startsWith('http') || val.startsWith('claude://')) {
-        saveChatLink(prNum, val, 'Custom link');
+      if (val.startsWith('http')) {
+        saveChatLink(prNum, val, 'Custom link', '');
         overlay.remove();
       }
     }
@@ -1015,7 +1075,7 @@ async function showChatModal(prNum, existing) {
   list.addEventListener('click', e => {
     const item = e.target.closest('.session-item');
     if (!item) return;
-    saveChatLink(prNum, item.dataset.url, item.dataset.title);
+    saveChatLink(prNum, item.dataset.url, item.dataset.title, item.dataset.id || '');
     overlay.remove();
   });
 
@@ -1035,11 +1095,11 @@ async function showChatModal(prNum, existing) {
   }
 }
 
-async function saveChatLink(prNum, url, title) {
+async function saveChatLink(prNum, url, title, id) {
   await fetch('/api/chat-links', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({pr: String(prNum), url, title}),
+    body: JSON.stringify({pr: String(prNum), url, title, id: id || ''}),
   });
   await loadChatLinks();
   refresh();
@@ -1115,7 +1175,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/review":
             self._json_response(fetch_review_requests() or [])
         elif self.path == "/api/sessions":
-            self._json_response(scan_claude_sessions())
+            self._json_response(scan_cursor_sessions())
         elif self.path == "/api/chat-links":
             self._json_response(load_chat_links())
         elif self.path == "/api/watches":
@@ -1135,7 +1195,10 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("action") == "remove":
                 links.pop(data["pr"], None)
             else:
-                links[data["pr"]] = {"url": data["url"], "title": data.get("title", "")}
+                entry = {"url": data["url"], "title": data.get("title", "")}
+                if data.get("id"):
+                    entry["id"] = data["id"]
+                links[data["pr"]] = entry
             save_chat_links(links)
             self._json_response({"ok": True})
         elif self.path == "/api/watches":
@@ -1159,15 +1222,23 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length))
             title = data.get("title", "")
+            session_id = data.get("id", "")
             if not title:
                 self._json_response({"ok": False, "error": "No title provided"})
                 return
-            sessions = scan_claude_sessions()
-            match = any(s["title"].lower() == title.lower() for s in sessions)
-            if not match:
-                self._json_response({"ok": False, "error": f"Session \"{title}\" not found"})
+            sessions = scan_cursor_sessions()
+            match = None
+            if session_id:
+                match = next((s for s in sessions if s["id"] == session_id), None)
+            if match is None:
+                match = next(
+                    (s for s in sessions if s["title"].lower() == title.lower()),
+                    None,
+                )
+            if match is None:
+                self._json_response({"ok": False, "error": f"Chat \"{title}\" not found"})
                 return
-            open_claude_session(title)
+            open_cursor_session(match["title"])
             self._json_response({"ok": True})
         else:
             self.send_error(404)
