@@ -33,8 +33,10 @@ chmod +x install.sh
 
 The install script will:
 1. Ask for your repo (e.g. `facebook/react`) and create a `config.json`
-2. On macOS, install a background service that starts on login and restarts on crash
-3. On macOS, create a `PR Dashboard.app` in `~/Applications` for Spotlight/Dock launching
+2. On macOS, build `PR Dashboard.app` into `~/Applications` — launch it from Spotlight to open the dashboard, and launchd runs the same binary in the background to serve it
+3. On macOS, install that as a background service that starts on login and restarts on crash
+
+The macOS app needs Xcode Command Line Tools to compile its launcher. If you don't have them, run `xcode-select --install` first.
 
 After install, the server is already running — open `http://localhost:9847` or launch the app.
 
@@ -104,7 +106,7 @@ On macOS with [Cursor](https://cursor.com) installed, you can link each PR to th
 Cursor has no official "open this chat" URL scheme yet, so the reopen step drives Cmd+K search via AppleScript. Two setup notes:
 
 - **Cmd+K only searches chats inside the Agents Window.** In the classic editor window, Cmd+K opens the inline-edit prompt instead, and the title gets typed there. Open the Agents Window once (Cmd+Shift+P → "Open Agents Window") and keep it around — after that the flow works.
-- **Grant Accessibility permission to "PR Dashboard Server"** the first time you click a linked chat. The install script installs a `PR Dashboard Server.app` at `~/Applications/` so the permission lives on a stable path — no need to re-grant it every time Homebrew bumps Python. If the click does nothing you'll see an actionable toast pointing you at System Settings → Privacy & Security → Accessibility.
+- **Enable "PR Dashboard" under System Settings → Privacy & Security → Accessibility.** The install script builds `~/Applications/PR Dashboard.app` as a small compiled launcher, so macOS attributes the permission to the app itself rather than to the Python binary behind it — the grant then survives Homebrew Python upgrades. If a click does nothing, the dashboard shows a toast naming the exact setting to flip.
 
 Chat titles come from Cursor's local index (`state.vscdb` + `conversation-search.db` under `~/Library/Application Support/Cursor/User/globalStorage/`). The dashboard reads them read-only — nothing is written to Cursor's data. If a linked chat can no longer be found, you'll get an error toast instead of quietly landing in an unrelated chat.
 

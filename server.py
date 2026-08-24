@@ -99,9 +99,13 @@ def open_cursor_session(title):
     if result.returncode != 0:
         if "1002" in stderr or "not allowed to send keystrokes" in stderr:
             return (
-                "macOS is blocking keystrokes. Grant Accessibility permission to "
-                "Python (System Settings → Privacy & Security → Accessibility) "
-                "and restart the dashboard."
+                "Enable \"PR Dashboard\" under System Settings → Privacy & "
+                "Security → Accessibility, then click again."
+            )
+        if "-1743" in stderr or "Not authorised to send Apple events" in stderr:
+            return (
+                "Enable \"PR Dashboard\" → System Events under System Settings → "
+                "Privacy & Security → Automation, then click again."
             )
         return stderr.splitlines()[-1] if stderr else "osascript failed"
     return None

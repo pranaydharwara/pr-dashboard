@@ -63,31 +63,63 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     PLIST_LABEL="com.prdashboard.server"
     PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
     PYTHON3_PATH="$(which python3)"
-    SERVER_APP="$HOME/Applications/PR Dashboard Server.app"
-    SERVER_APP_EXEC="$SERVER_APP/Contents/MacOS/PR Dashboard Server"
+    APP="$HOME/Applications/PR Dashboard.app"
+    APP_EXEC="$APP/Contents/MacOS/PR Dashboard"
 
     # Stop existing service if running
     launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
 
-    # Build a .app bundle for the server so macOS Accessibility permission
-    # attaches to a stable path (survives brew Python version bumps that
-    # otherwise silently revoke the grant on the raw python binary).
+    # One app bundle handles both jobs: launched with --serve by launchd it runs
+    # the server, launched normally (Spotlight/Dock) it opens the dashboard.
+    #
+    # The executable is a compiled binary rather than a shell script on purpose.
+    # A script runs as /bin/bash, so macOS would attribute the Accessibility
+    # grant to bash instead of this app and the keystroke feature could never be
+    # authorised. Compiling also pins the grant to this bundle rather than to a
+    # versioned Homebrew python path that changes on upgrade.
     mkdir -p "$HOME/Applications"
-    rm -rf "$SERVER_APP"
-    mkdir -p "$SERVER_APP/Contents/MacOS"
-    cat > "$SERVER_APP/Contents/Info.plist" << APPPLIST
+    rm -rf "$APP" "$HOME/Applications/PR Dashboard Server.app"
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+    if ! cc -O2 -Wall -o "$APP_EXEC" "$SCRIPT_DIR/launcher.c" \
+        -DPRD_PYTHON="\"$PYTHON3_PATH\"" \
+        -DPRD_DIR="\"$SCRIPT_DIR\"" \
+        -DPRD_URL="\"http://localhost:${PORT}\"" 2>/dev/null; then
+        echo "  ✗ Could not compile the launcher (need Xcode Command Line Tools)."
+        echo "    Run 'xcode-select --install' and re-run this script."
+        exit 1
+    fi
+
+    # Build the .icns from the bundled icon.png
+    if [ -f "$SCRIPT_DIR/icon.png" ]; then
+        ICONSET="$(mktemp -d)/icon.iconset"
+        mkdir -p "$ICONSET"
+        for spec in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
+                    "64 icon_32x32@2x" "128 icon_128x128" "256 icon_128x128@2x" \
+                    "256 icon_256x256" "512 icon_256x256@2x" "512 icon_512x512" \
+                    "1024 icon_512x512@2x"; do
+            sips -z "${spec% *}" "${spec% *}" "$SCRIPT_DIR/icon.png" \
+                --out "$ICONSET/${spec#* }.png" >/dev/null 2>&1
+        done
+        iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns" 2>/dev/null || true
+        rm -rf "$(dirname "$ICONSET")"
+    fi
+
+    cat > "$APP/Contents/Info.plist" << APPPLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>PR Dashboard Server</string>
+    <string>PR Dashboard</string>
     <key>CFBundleIdentifier</key>
-    <string>${PLIST_LABEL}</string>
+    <string>com.prdashboard.app</string>
     <key>CFBundleName</key>
-    <string>PR Dashboard Server</string>
+    <string>PR Dashboard</string>
     <key>CFBundleDisplayName</key>
-    <string>PR Dashboard Server</string>
+    <string>PR Dashboard</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -96,28 +128,14 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     <string>1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
-    <key>LSBackgroundOnly</key>
-    <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>PR Dashboard opens your linked Cursor chats by sending keystrokes to Cursor.</string>
 </dict>
 </plist>
 APPPLIST
-    # Run python as a child rather than exec'ing into it: exec would replace the
-    # bundle executable's process image, and macOS would then attribute the
-    # Accessibility grant to the python binary instead of this app.
-    cat > "$SERVER_APP_EXEC" << RUNNER
-#!/bin/bash
-cd "${SCRIPT_DIR}"
-"${PYTHON3_PATH}" "${SCRIPT_DIR}/server.py" &
-CHILD=\$!
-trap 'kill -TERM \$CHILD 2>/dev/null' TERM INT
-wait \$CHILD
-RUNNER
-    chmod +x "$SERVER_APP_EXEC"
 
-    # Ad-hoc sign so the bundle has a stable identity that TCC lists by name.
-    codesign --force --deep --sign - "$SERVER_APP" 2>/dev/null || true
+    # Ad-hoc sign so TCC has a stable identity to list the app under.
+    codesign --force --deep --sign - "$APP" 2>/dev/null || true
 
     # Create launchd agent (auto-starts on login, restarts on crash)
     mkdir -p "$HOME/Library/LaunchAgents"
@@ -130,7 +148,8 @@ RUNNER
     <string>${PLIST_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${SERVER_APP_EXEC}</string>
+        <string>${APP_EXEC}</string>
+        <string>--serve</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${SCRIPT_DIR}</string>
@@ -154,17 +173,10 @@ PLIST
     # Start the service now
     launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
     echo "  ✓ Background service installed (starts on login, restarts on crash)"
-    echo "  ✓ Server app: $SERVER_APP"
-    echo ""
-    echo "  Grant Accessibility permission to \"PR Dashboard Server\" once"
-    echo "  (System Settings → Privacy & Security → Accessibility) so it can"
-    echo "  send keystrokes to Cursor when you click a linked chat."
-
-    # Create macOS app that just opens the browser
-    rm -rf "$HOME/Applications/PR Dashboard.app"
-    osacompile -o "$HOME/Applications/PR Dashboard.app" \
-        -e "open location \"http://localhost:${PORT}\""
     echo "  ✓ Created ~/Applications/PR Dashboard.app"
+    echo ""
+    echo "  To use Cursor chat linking, enable \"PR Dashboard\" under"
+    echo "  System Settings → Privacy & Security → Accessibility."
 fi
 
 echo ""

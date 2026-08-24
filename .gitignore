@@ -2,6 +2,7 @@ config.json
 chat-links.json
 watches.json
 dashboard.log
+icon.icns
 __pycache__/
 *.pyc
 .DS_Store
