@@ -9,9 +9,12 @@ import sys
 import signal
 import socket
 import threading
+import time
+import uuid
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -33,6 +36,13 @@ def load_config():
 CONFIG = load_config()
 REPO = CONFIG["repo"]
 PORT = CONFIG["port"]
+
+
+def dashboard_url(path="/"):
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"http://localhost:{PORT}{path}"
+
 
 PR_FIELDS = ",".join([
     "number", "title", "url", "state", "isDraft", "createdAt", "updatedAt",
@@ -223,6 +233,8 @@ def scan_cursor_sessions():
 
 
 WATCHES_PATH = Path(__file__).parent / "watches.json"
+ALERTS_PATH = Path(__file__).parent / "alerts.json"
+ALERTS_LOCK = threading.Lock()
 
 
 def load_watches():
@@ -237,12 +249,72 @@ def save_watches(watches):
         json.dump(watches, f, indent=2)
 
 
-def send_notification(title, body):
-    script = f'display notification "{body}" with title "{title}"'
+def load_alerts():
+    with ALERTS_LOCK:
+        if not ALERTS_PATH.exists():
+            return []
+        try:
+            with open(ALERTS_PATH) as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+
+def save_alerts(alerts):
+    with ALERTS_LOCK:
+        with open(ALERTS_PATH, "w") as f:
+            json.dump(alerts[-200:], f, indent=2)
+
+
+def send_notification(title, body, alert_id):
+    app_executable = (
+        Path.home() / "Applications" / "PR Dashboard.app" /
+        "Contents" / "MacOS" / "PR Dashboard"
+    )
+    notify_url = dashboard_url(f"/?alert={alert_id}")
+    if app_executable.exists():
+        subprocess.Popen(
+            [str(app_executable), "--notify", title, body, notify_url, alert_id],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return
+    # Fallback for manual/non-app installs. This notification is not clickable.
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+    safe_body = body.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'display notification "{safe_body}" with title "{safe_title}"'
     subprocess.Popen(
         ["osascript", "-e", script],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+
+
+def create_alert(kind, title, body, pr_num, pr_url):
+    alert = {
+        "id": str(uuid.uuid4()),
+        "kind": kind,
+        "title": title,
+        "body": body,
+        "pr": str(pr_num),
+        "pr_url": pr_url,
+        "created_at": int(time.time()),
+        "read": False,
+    }
+    alerts = load_alerts()
+    alerts.append(alert)
+    save_alerts(alerts)
+    send_notification(title, body, alert["id"])
+    return alert
+
+
+def _ci_failures(pr):
+    failures = []
+    for check in pr.get("statusCheckRollup") or []:
+        if check.get("__typename") == "CheckRun" and check.get("conclusion") == "FAILURE":
+            failures.append(check.get("name") or "Unknown check")
+        elif check.get("__typename") == "StatusContext" and check.get("state") == "FAILURE":
+            failures.append(check.get("context") or "Unknown check")
+    return failures
 
 
 def _classify_ci(pr):
@@ -263,9 +335,11 @@ def _classify_ci(pr):
 def _pr_state(pr):
     return {
         "ci": _classify_ci(pr),
+        "ci_failures": _ci_failures(pr),
         "review": pr.get("reviewDecision", ""),
         "mergeable": pr.get("mergeable", ""),
         "title": pr.get("title", ""),
+        "url": pr.get("url", ""),
     }
 
 
@@ -285,16 +359,21 @@ def check_watches():
         title = curr["title"]
         short = f"#{pr_num} {title[:50]}"
         if prev.get("ci") in ("passing", "pending") and curr["ci"] == "failing":
-            send_notification("CI Failed", short)
+            failed = curr.get("ci_failures") or []
+            detail = ", ".join(failed[:3])
+            if len(failed) > 3:
+                detail += f" +{len(failed) - 3} more"
+            body = f"{short} — {detail}" if detail else short
+            create_alert("ci_failed", "CI Failed", body, pr_num, curr["url"])
         elif prev.get("ci") == "failing" and curr["ci"] == "passing":
-            send_notification("CI Passed", short)
+            create_alert("ci_passed", "CI Passed", short, pr_num, curr["url"])
         if prev.get("review") != "APPROVED" and curr["review"] == "APPROVED":
-            send_notification("PR Approved", short)
+            create_alert("approved", "PR Approved", short, pr_num, curr["url"])
         if prev.get("review") != "CHANGES_REQUESTED" and curr["review"] == "CHANGES_REQUESTED":
-            send_notification("Changes Requested", short)
+            create_alert("changes_requested", "Changes Requested", short, pr_num, curr["url"])
         if prev.get("mergeable") != "MERGEABLE" and curr["mergeable"] == "MERGEABLE" \
                 and curr["review"] == "APPROVED" and curr["ci"] == "passing":
-            send_notification("Ready to Merge", short)
+            create_alert("ready", "Ready to Merge", short, pr_num, curr["url"])
         if curr != {k: prev.get(k) for k in curr}:
             watches[pr_num] = curr
             changed = True
@@ -400,6 +479,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* Header */
   .header { margin-bottom: 20px; }
   .header-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; }
+  .header-actions { display: flex; align-items: center; gap: 12px; }
   h1 { font-size: 24px; font-weight: 800; letter-spacing: -0.5px; }
   .subtitle { font-size: 13px; color: var(--text3); font-weight: 500; }
   .refresh-info {
@@ -421,6 +501,58 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     cursor: pointer; transition: all 0.15s;
   }
   .btn-refresh:hover { background: var(--bg-hover); border-color: var(--text3); }
+  .alerts-button {
+    position: relative; width: 32px; height: 32px; border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--bg-card); border: 1px solid var(--border); color: var(--text2);
+    cursor: pointer;
+  }
+  .alerts-button:hover { background: var(--bg-hover); color: var(--text); }
+  .alerts-button svg { width: 16px; height: 16px; }
+  .alerts-count {
+    position: absolute; top: -6px; right: -6px; min-width: 17px; height: 17px;
+    border-radius: 9px; padding: 0 4px; background: var(--red); color: #fff;
+    font-size: 9px; font-weight: 800; display: none; align-items: center; justify-content: center;
+  }
+
+  /* Alert inbox */
+  .alerts-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.32); z-index: 100;
+    display: flex; justify-content: flex-end; backdrop-filter: blur(1px);
+  }
+  .alerts-panel {
+    width: 420px; max-width: 92vw; height: 100%; background: var(--bg-card);
+    border-left: 1px solid var(--border); box-shadow: var(--shadow-lg);
+    display: flex; flex-direction: column;
+  }
+  .alerts-panel-header {
+    padding: 20px; display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+  }
+  .alerts-panel-header h2 { font-size: 17px; }
+  .alerts-panel-actions { display: flex; align-items: center; gap: 8px; }
+  .alerts-panel-actions button {
+    border: 1px solid var(--border); background: var(--bg); color: var(--text2);
+    border-radius: 7px; padding: 6px 9px; font-size: 11px; font-weight: 600; cursor: pointer;
+  }
+  .alerts-list { overflow-y: auto; flex: 1; }
+  .alert-item {
+    padding: 15px 20px; border-bottom: 1px solid var(--border);
+    display: grid; grid-template-columns: 8px 1fr; gap: 10px;
+  }
+  .alert-item.unread { background: var(--blue-bg); }
+  .alert-dot { width: 7px; height: 7px; border-radius: 50%; background: transparent; margin-top: 5px; }
+  .alert-item.unread .alert-dot { background: var(--blue); }
+  .alert-title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .alert-title { font-size: 13px; font-weight: 700; }
+  .alert-time { color: var(--text3); font-size: 10px; white-space: nowrap; }
+  .alert-body { color: var(--text2); font-size: 12px; line-height: 1.45; margin-top: 3px; }
+  .alert-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .alert-actions button, .alert-actions a {
+    color: var(--blue); border: none; background: none; font-size: 11px;
+    font-weight: 600; cursor: pointer; text-decoration: none; padding: 0;
+  }
+  .alerts-empty { padding: 60px 20px; text-align: center; color: var(--text3); font-size: 13px; }
 
   /* Stat cards */
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 32px; }
@@ -509,6 +641,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     font-size: 10.5px; color: var(--red); margin-top: 3px;
     line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .ci-summary { margin-top: 3px; color: var(--red); font-size: 10.5px; }
+  .ci-summary summary { cursor: pointer; list-style: none; line-height: 1.3; }
+  .ci-summary summary::-webkit-details-marker { display: none; }
+  .ci-summary summary::before { content: '› '; font-weight: 800; }
+  .ci-summary[open] summary::before { content: '⌄ '; }
+  .ci-summary-list { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+  .ci-summary-list a, .ci-summary-list span {
+    color: var(--red); text-decoration: none; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; display: block;
+  }
+  .ci-summary-list a:hover { text-decoration: underline; }
 
   /* Size */
   .size-pill {
@@ -657,10 +800,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="header">
     <div class="header-top">
       <h1>PR Dashboard</h1>
-      <div class="refresh-info" id="refresh-info">
-        <span class="live-dot"></span>
-        <span id="refresh-text">Loading...</span>
-        <button class="btn-refresh" onclick="refresh()">Refresh</button>
+      <div class="header-actions">
+        <button class="alerts-button" onclick="showAlerts()" aria-label="Open alerts">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M10 21h4"></path></svg>
+          <span class="alerts-count" id="alerts-count"></span>
+        </button>
+        <div class="refresh-info" id="refresh-info">
+          <span class="live-dot"></span>
+          <span id="refresh-text">Loading...</span>
+          <button class="btn-refresh" onclick="refresh()">Refresh</button>
+        </div>
       </div>
     </div>
     <div class="subtitle">__REPO__</div>
@@ -689,12 +838,21 @@ function sizeInfo(add, del) {
   return ['XXL', '#dc2626', 100];
 }
 
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function classifyCi(checks) {
   if (!checks || !checks.length) return ['unknown', []];
   const failures = [];
   for (const c of checks) {
-    if (c.__typename === 'CheckRun' && c.conclusion === 'FAILURE') failures.push(c.name || 'unknown');
-    else if (c.__typename === 'StatusContext' && c.state === 'FAILURE') failures.push(c.context || 'unknown');
+    if (c.__typename === 'CheckRun' && c.conclusion === 'FAILURE') {
+      failures.push({name: c.name || 'Unknown check', url: c.detailsUrl || ''});
+    } else if (c.__typename === 'StatusContext' && c.state === 'FAILURE') {
+      failures.push({name: c.context || 'Unknown check', url: c.targetUrl || ''});
+    }
   }
   if (failures.length) return ['failing', failures];
   const pending = checks.some(c =>
@@ -709,10 +867,17 @@ function ciBadge(status, failures) {
   if (status === 'passing') return '<span class="badge badge-green"><span class="badge-dot" style="background:currentColor"></span>Passing</span>';
   if (status === 'pending') return '<span class="badge badge-blue"><span class="badge-dot" style="background:currentColor"></span>Running</span>';
   if (status === 'failing') {
-    const short = failures.slice(0, 2).join(', ');
+    const short = failures.slice(0, 2).map(f => f.name).join(', ');
     const extra = failures.length > 2 ? ` +${failures.length - 2}` : '';
+    const list = failures.map(f => f.url
+      ? `<a href="${escapeHtml(f.url)}" target="_blank" rel="noopener">${escapeHtml(f.name)}</a>`
+      : `<span>${escapeHtml(f.name)}</span>`
+    ).join('');
     return `<span class="badge badge-red"><span class="badge-dot" style="background:currentColor"></span>Failing</span>
-      <div class="ci-fail-detail">${short}${extra}</div>`;
+      <details class="ci-summary">
+        <summary>${escapeHtml(short)}${extra}</summary>
+        <div class="ci-summary-list">${list}</div>
+      </details>`;
   }
   return '<span class="badge badge-gray">Unknown</span>';
 }
@@ -786,7 +951,7 @@ function render(prs) {
 
   function row(pr, section) {
     const branch = pr.headRefName || '';
-    return `<tr draggable="true" data-pr="${pr.number}" data-section="${section}">
+    return `<tr id="pr-${pr.number}" draggable="true" data-pr="${pr.number}" data-section="${section}">
       <td><span class="drag-handle">&#8942;&#8942;</span></td>
       <td>
         <a href="${pr.url}" target="_blank" class="pr-title">${pr.title}</a>
@@ -941,12 +1106,101 @@ function saveOrder(section) {
 }
 
 let chatLinks = {};
+let alerts = [];
+let alertPanelOpenedFromUrl = false;
 
 async function loadChatLinks() {
   try {
     const res = await fetch('/api/chat-links');
     chatLinks = await res.json();
   } catch (e) { chatLinks = {}; }
+}
+
+async function loadAlerts() {
+  try {
+    const res = await fetch('/api/alerts');
+    alerts = await res.json();
+  } catch (e) {
+    alerts = [];
+  }
+  const count = alerts.filter(a => !a.read).length;
+  const badge = document.getElementById('alerts-count');
+  if (badge) {
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.style.display = count ? 'inline-flex' : 'none';
+  }
+}
+
+function alertTime(epoch) {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - epoch));
+  if (seconds < 60) return 'now';
+  if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + 'h';
+  return Math.floor(seconds / 86400) + 'd';
+}
+
+function renderAlertsList() {
+  if (!alerts.length) {
+    return '<div class="alerts-empty">No alerts yet. Watch a PR to be notified about CI and review changes.</div>';
+  }
+  return alerts.map(a => `
+    <div class="alert-item ${a.read ? '' : 'unread'}" data-alert-id="${escapeHtml(a.id)}">
+      <span class="alert-dot"></span>
+      <div>
+        <div class="alert-title-row">
+          <span class="alert-title">${escapeHtml(a.title)}</span>
+          <span class="alert-time">${alertTime(a.created_at)}</span>
+        </div>
+        <div class="alert-body">${escapeHtml(a.body)}</div>
+        <div class="alert-actions">
+          ${a.read ? '' : `<button onclick="markAlertRead('${escapeHtml(a.id)}')">Mark read</button>`}
+          ${a.pr_url ? `<a href="${escapeHtml(a.pr_url)}" target="_blank" rel="noopener" onclick="markAlertRead('${escapeHtml(a.id)}')">Open PR</a>` : ''}
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function showAlerts() {
+  const existing = document.querySelector('.alerts-overlay');
+  if (existing) existing.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'alerts-overlay';
+  overlay.innerHTML = `
+    <aside class="alerts-panel">
+      <div class="alerts-panel-header">
+        <h2>Alerts</h2>
+        <div class="alerts-panel-actions">
+          ${alerts.some(a => !a.read) ? '<button onclick="markAllAlertsRead()">Mark all read</button>' : ''}
+          <button onclick="this.closest('.alerts-overlay').remove()" aria-label="Close alerts">Close</button>
+        </div>
+      </div>
+      <div class="alerts-list">${renderAlertsList()}</div>
+    </aside>`;
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+}
+
+async function markAlertRead(id) {
+  await fetch('/api/alerts', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'read', id}),
+  });
+  await loadAlerts();
+  showAlerts();
+}
+
+async function markAllAlertsRead() {
+  await fetch('/api/alerts', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'read_all'}),
+  });
+  await loadAlerts();
+  showAlerts();
 }
 
 let watchedPrs = new Set();
@@ -1133,10 +1387,14 @@ async function refresh() {
   info.classList.add('loading');
   text.textContent = 'Refreshing...';
   try {
-    await Promise.all([loadChatLinks(), loadWatches()]);
+    await Promise.all([loadChatLinks(), loadWatches(), loadAlerts()]);
     const res = await fetch(isReviewPage ? '/api/review' : '/api/prs');
     const prs = await res.json();
     render(prs);
+    if (!alertPanelOpenedFromUrl && new URLSearchParams(location.search).has('alert')) {
+      alertPanelOpenedFromUrl = true;
+      showAlerts();
+    }
     const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     text.textContent = `Updated ${now} · next in 5m`;
     info.classList.remove('loading');
@@ -1192,25 +1450,29 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/api/prs":
+        path = urlparse(self.path).path
+        if path == "/api/prs":
             self._json_response(fetch_prs() or [])
-        elif self.path == "/api/review":
+        elif path == "/api/review":
             self._json_response(fetch_review_requests() or [])
-        elif self.path == "/api/sessions":
+        elif path == "/api/sessions":
             self._json_response(scan_cursor_sessions())
-        elif self.path == "/api/chat-links":
+        elif path == "/api/chat-links":
             self._json_response(load_chat_links())
-        elif self.path == "/api/watches":
+        elif path == "/api/watches":
             self._json_response(load_watches())
-        elif self.path == "/review":
+        elif path == "/api/alerts":
+            self._json_response(list(reversed(load_alerts())))
+        elif path == "/review":
             self._html_response(REVIEW_HTML)
-        elif self.path == "/" or self.path == "":
+        elif path == "/" or path == "":
             self._html_response(DASHBOARD_HTML)
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path == "/api/chat-links":
+        path = urlparse(self.path).path
+        if path == "/api/chat-links":
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length))
             links = load_chat_links()
@@ -1223,7 +1485,7 @@ class Handler(BaseHTTPRequestHandler):
                 links[data["pr"]] = entry
             save_chat_links(links)
             self._json_response({"ok": True})
-        elif self.path == "/api/watches":
+        elif path == "/api/watches":
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length))
             watches = load_watches()
@@ -1240,7 +1502,26 @@ class Handler(BaseHTTPRequestHandler):
                     watches[pr_num] = {}
             save_watches(watches)
             self._json_response({"ok": True})
-        elif self.path == "/api/open-session":
+        elif path == "/api/alerts":
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length))
+            alerts = load_alerts()
+            action = data.get("action")
+            if action == "read":
+                alert_id = data.get("id", "")
+                for alert in alerts:
+                    if alert.get("id") == alert_id:
+                        alert["read"] = True
+                        break
+            elif action == "read_all":
+                for alert in alerts:
+                    alert["read"] = True
+            else:
+                self._json_response({"ok": False, "error": "Unknown action"})
+                return
+            save_alerts(alerts)
+            self._json_response({"ok": True})
+        elif path == "/api/open-session":
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length))
             title = data.get("title", "")
@@ -1279,8 +1560,8 @@ def port_in_use(port):
 
 def main():
     if port_in_use(PORT):
-        print(f"Dashboard already running. Opening http://localhost:{PORT}")
-        webbrowser.open(f"http://localhost:{PORT}")
+        print(f"Dashboard already running. Opening {dashboard_url()}")
+        webbrowser.open(dashboard_url())
         return
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
@@ -1290,8 +1571,8 @@ def main():
     watcher.start()
 
     server = HTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"PR Dashboard running at http://localhost:{PORT}")
-    webbrowser.open(f"http://localhost:{PORT}")
+    print(f"PR Dashboard running at {dashboard_url()}")
+    webbrowser.open(dashboard_url())
     server.serve_forever()
 
 

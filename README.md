@@ -9,7 +9,8 @@ A local status page for your GitHub pull requests. Zero dependencies beyond Pyth
 - **My PRs** — all your open PRs with review status, CI, merge state, age, and size
 - **To Review** — PRs where you're personally requested as a reviewer (filters out team-only requests)
 - **Cursor chat integration** (macOS) — link PRs to Cursor chats and reopen them with one click
-- **Opt-in notifications** (macOS) — watch individual PRs and get native macOS notifications on state changes
+- **CI failure summaries** — see every failing check and open its details directly
+- **Alert inbox + native notifications** (macOS) — watch PRs, keep a read/unread history, and click notifications to open the dashboard
 - Auto-refreshes every 5 minutes
 - Drag-and-drop to prioritize PRs within each section (saved to browser localStorage)
 - Light/dark mode follows your system preference
@@ -76,7 +77,7 @@ On macOS, the install script sets up a `launchd` agent so the dashboard:
 - **Restarts on crash** — if the process dies, macOS brings it back
 - **Runs silently** in the background with no terminal window
 
-The `PR Dashboard.app` simply opens your browser to the dashboard.
+The same `PR Dashboard.app` hosts clickable native notifications in the background and opens your browser when launched from Spotlight or the Dock.
 
 ### Managing the service
 
@@ -123,7 +124,9 @@ Notifications are opt-in per PR — no noise by default. Click the bell icon on 
 - **PR approved** or **changes requested**
 - **Ready to merge** — approved, CI green, and no conflicts
 
-Click the bell again to stop watching. Watch state is stored locally in `watches.json` (gitignored).
+Clicking a native notification opens the dashboard alert inbox. The header bell shows the unread count; alerts can be marked read individually or all at once, and each alert links to its PR. CI failure alerts include the names of the failing checks.
+
+Click the PR-row bell again to stop watching. Watch state is stored locally in `watches.json`; alert history is stored in `alerts.json` (both gitignored, capped at the latest 200 alerts).
 
 ## How It Works
 

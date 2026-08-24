@@ -81,10 +81,11 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     rm -rf "$APP" "$HOME/Applications/PR Dashboard Server.app"
     mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-    if ! cc -O2 -Wall -o "$APP_EXEC" "$SCRIPT_DIR/launcher.c" \
+    if ! cc -O2 -Wall -fobjc-arc -o "$APP_EXEC" "$SCRIPT_DIR/launcher.m" \
         -DPRD_PYTHON="\"$PYTHON3_PATH\"" \
         -DPRD_DIR="\"$SCRIPT_DIR\"" \
-        -DPRD_URL="\"http://localhost:${PORT}\"" 2>/dev/null; then
+        -DPRD_URL="\"http://localhost:${PORT}\"" \
+        -framework Cocoa -framework UserNotifications 2>/dev/null; then
         echo "  ✗ Could not compile the launcher (need Xcode Command Line Tools)."
         echo "    Run 'xcode-select --install' and re-run this script."
         exit 1
@@ -134,8 +135,11 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
 </plist>
 APPPLIST
 
-    # Ad-hoc sign so TCC has a stable identity to list the app under.
-    codesign --force --deep --sign - "$APP" 2>/dev/null || true
+    # Use a stable designated requirement instead of the default ad-hoc cdhash.
+    # That keeps Accessibility approval attached across launcher rebuilds.
+    codesign --force --deep --sign - \
+        --requirements '=designated => identifier "com.prdashboard.app"' \
+        "$APP" 2>/dev/null || true
 
     # Create launchd agent (auto-starts on login, restarts on crash)
     mkdir -p "$HOME/Library/LaunchAgents"
