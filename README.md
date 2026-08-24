@@ -8,6 +8,9 @@ A local status page for your GitHub pull requests. Zero dependencies beyond Pyth
 
 - **My PRs** — all your open PRs with review status, CI, merge state, age, and size
 - **To Review** — PRs where you're personally requested as a reviewer (filters out team-only requests)
+- **Behind-base detection** — the Merge column calls out when a PR has fallen behind its base branch, not just whether it conflicts
+- **Update from base** — merge `main` (or whatever the PR's base is) into a PR branch with one confirmed click. Creates a merge commit on the head branch on GitHub — never rebases, never merges the PR into main.
+- **AI PR summaries** — on-demand structured explanations (purpose, blockers, requested changes, failing CI, next steps) via the Cursor Agent CLI, cached locally
 - **Cursor chat integration** (macOS) — link PRs to Cursor chats and reopen them with one click
 - **CI failure summaries** — see every failing check and open its details directly
 - **Alert inbox + native notifications** (macOS) — watch PRs, keep a read/unread history, and click notifications to open the dashboard
@@ -99,6 +102,15 @@ On Linux or WSL, run the server directly or add it to your init system:
 ```bash
 python3 server.py &
 ```
+
+## PR Row Actions
+
+Status lives in the table columns — Review, CI (with failing check names), Merge, Age — so there's one list, not a summary plus a duplicate. The Merge column shows `Behind <base>` when a PR has drifted behind its base branch, `Conflicts` when it can't merge, and `Clean` otherwise. Two action buttons sit inline on each PR row:
+
+- **Update from base** — appears when a PR's `mergeStateStatus` is `BEHIND`. Clicking asks for confirmation, then calls GitHub's `update-branch` API to merge the base branch (e.g. `main`) into the PR's head branch. It uses `expected_head_sha` so a stale click aborts rather than clobbering a newer commit. Cross-repo PRs are supported only when the maintainer-can-modify flag is on. The action never rebases and never merges the PR into main.
+- **AI summary** — runs the installed [Cursor Agent CLI](https://cursor.com/cli) (`agent`) in read-only Ask mode against the PR's metadata, reviews, and diff (truncated at 60 KB). The result is a short markdown breakdown of purpose, blockers, requested changes, failing CI, and next steps. Summaries are cached in `ai-summaries.json` per PR; a stale-SHA badge appears if the PR head has moved since the summary was generated, and there's a Regenerate button. PRs never generate summaries automatically — the CLI runs only when you click.
+
+Set `PR_DASHBOARD_AGENT=/path/to/agent` in the environment if the CLI lives somewhere unusual.
 
 ## Cursor Chat Linking
 

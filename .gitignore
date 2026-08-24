@@ -2,6 +2,7 @@ config.json
 chat-links.json
 watches.json
 alerts.json
+ai-summaries.json
 dashboard.log
 icon.icns
 __pycache__/
