@@ -86,7 +86,25 @@ def open_cursor_session(title):
         key code 36
     end tell
     '''
-    subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=6,
+        )
+    except subprocess.TimeoutExpired:
+        return "Cursor didn't respond in time"
+    except OSError as e:
+        return f"Failed to launch osascript: {e}"
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        if "1002" in stderr or "not allowed to send keystrokes" in stderr:
+            return (
+                "macOS is blocking keystrokes. Grant Accessibility permission to "
+                "Python (System Settings → Privacy & Security → Accessibility) "
+                "and restart the dashboard."
+            )
+        return stderr.splitlines()[-1] if stderr else "osascript failed"
+    return None
 
 
 def load_chat_links():
@@ -1238,7 +1256,10 @@ class Handler(BaseHTTPRequestHandler):
             if match is None:
                 self._json_response({"ok": False, "error": f"Chat \"{title}\" not found"})
                 return
-            open_cursor_session(match["title"])
+            err = open_cursor_session(match["title"])
+            if err:
+                self._json_response({"ok": False, "error": err})
+                return
             self._json_response({"ok": True})
         else:
             self.send_error(404)
