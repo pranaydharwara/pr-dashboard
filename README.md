@@ -104,7 +104,7 @@ On macOS with [Cursor](https://cursor.com) installed, you can link each PR to th
 Cursor has no official "open this chat" URL scheme yet, so the reopen step drives Cmd+K search via AppleScript. Two setup notes:
 
 - **Cmd+K only searches chats inside the Agents Window.** In the classic editor window, Cmd+K opens the inline-edit prompt instead, and the title gets typed there. Open the Agents Window once (Cmd+Shift+P → "Open Agents Window") and keep it around — after that the flow works.
-- **Grant Accessibility permissions.** System Settings → Privacy & Security → Accessibility → enable your terminal / launchd / Cursor so `osascript` can send the keystrokes.
+- **Grant Accessibility permission to "PR Dashboard Server"** the first time you click a linked chat. The install script installs a `PR Dashboard Server.app` at `~/Applications/` so the permission lives on a stable path — no need to re-grant it every time Homebrew bumps Python. If the click does nothing you'll see an actionable toast pointing you at System Settings → Privacy & Security → Accessibility.
 
 Chat titles come from Cursor's local index (`state.vscdb` + `conversation-search.db` under `~/Library/Application Support/Cursor/User/globalStorage/`). The dashboard reads them read-only — nothing is written to Cursor's data. If a linked chat can no longer be found, you'll get an error toast instead of quietly landing in an unrelated chat.
 

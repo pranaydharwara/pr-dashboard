@@ -63,9 +63,52 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     PLIST_LABEL="com.prdashboard.server"
     PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
     PYTHON3_PATH="$(which python3)"
+    SERVER_APP="$HOME/Applications/PR Dashboard Server.app"
+    SERVER_APP_EXEC="$SERVER_APP/Contents/MacOS/PR Dashboard Server"
 
     # Stop existing service if running
     launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+
+    # Build a .app bundle for the server so macOS Accessibility permission
+    # attaches to a stable path (survives brew Python version bumps that
+    # otherwise silently revoke the grant on the raw python binary).
+    mkdir -p "$HOME/Applications"
+    rm -rf "$SERVER_APP"
+    mkdir -p "$SERVER_APP/Contents/MacOS"
+    cat > "$SERVER_APP/Contents/Info.plist" << APPPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>PR Dashboard Server</string>
+    <key>CFBundleIdentifier</key>
+    <string>${PLIST_LABEL}</string>
+    <key>CFBundleName</key>
+    <string>PR Dashboard Server</string>
+    <key>CFBundleDisplayName</key>
+    <string>PR Dashboard Server</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSBackgroundOnly</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>PR Dashboard opens your linked Cursor chats by sending keystrokes to Cursor.</string>
+</dict>
+</plist>
+APPPLIST
+    cat > "$SERVER_APP_EXEC" << RUNNER
+#!/bin/bash
+cd "${SCRIPT_DIR}"
+exec "${PYTHON3_PATH}" "${SCRIPT_DIR}/server.py"
+RUNNER
+    chmod +x "$SERVER_APP_EXEC"
 
     # Create launchd agent (auto-starts on login, restarts on crash)
     mkdir -p "$HOME/Library/LaunchAgents"
@@ -78,8 +121,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     <string>${PLIST_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${PYTHON3_PATH}</string>
-        <string>${SCRIPT_DIR}/server.py</string>
+        <string>${SERVER_APP_EXEC}</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${SCRIPT_DIR}</string>
@@ -103,9 +145,13 @@ PLIST
     # Start the service now
     launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
     echo "  ✓ Background service installed (starts on login, restarts on crash)"
+    echo "  ✓ Server app: $SERVER_APP"
+    echo ""
+    echo "  Grant Accessibility permission to \"PR Dashboard Server\" once"
+    echo "  (System Settings → Privacy & Security → Accessibility) so it can"
+    echo "  send keystrokes to Cursor when you click a linked chat."
 
     # Create macOS app that just opens the browser
-    mkdir -p ~/Applications
     rm -rf "$HOME/Applications/PR Dashboard.app"
     osacompile -o "$HOME/Applications/PR Dashboard.app" \
         -e "open location \"http://localhost:${PORT}\""
