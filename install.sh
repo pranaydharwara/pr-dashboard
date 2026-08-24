@@ -103,12 +103,21 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
 </dict>
 </plist>
 APPPLIST
+    # Run python as a child rather than exec'ing into it: exec would replace the
+    # bundle executable's process image, and macOS would then attribute the
+    # Accessibility grant to the python binary instead of this app.
     cat > "$SERVER_APP_EXEC" << RUNNER
 #!/bin/bash
 cd "${SCRIPT_DIR}"
-exec "${PYTHON3_PATH}" "${SCRIPT_DIR}/server.py"
+"${PYTHON3_PATH}" "${SCRIPT_DIR}/server.py" &
+CHILD=\$!
+trap 'kill -TERM \$CHILD 2>/dev/null' TERM INT
+wait \$CHILD
 RUNNER
     chmod +x "$SERVER_APP_EXEC"
+
+    # Ad-hoc sign so the bundle has a stable identity that TCC lists by name.
+    codesign --force --deep --sign - "$SERVER_APP" 2>/dev/null || true
 
     # Create launchd agent (auto-starts on login, restarts on crash)
     mkdir -p "$HOME/Library/LaunchAgents"
