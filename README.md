@@ -7,7 +7,7 @@ A local status page for your GitHub pull requests. Zero dependencies beyond Pyth
 ## Features
 
 - **My PRs** — all your open PRs with review status, CI, merge state, age, and size
-- **To Review** — PRs where you're personally requested as a reviewer (filters out team-only requests)
+- **To Review** — PRs where you or one of your GitHub teams is requested, with per-team filter tabs (Assigned to me, one per team, All)
 - **Behind-base detection** — the Merge column calls out when a PR has fallen behind its base branch, not just whether it conflicts
 - **Update from base** — merge `main` (or whatever the PR's base is) into a PR branch with one confirmed click. Creates a merge commit on the head branch on GitHub — never rebases, never merges the PR into main.
 - **AI PR summaries** — on-demand structured explanations (purpose, blockers, requested changes, failing CI, next steps) via the Cursor Agent CLI, cached locally
@@ -111,6 +111,20 @@ Status lives in the table columns — Review, CI (with failing check names), Mer
 - **AI summary** — runs the installed [Cursor Agent CLI](https://cursor.com/cli) (`agent`) in read-only Ask mode against the PR's metadata, reviews, and diff (truncated at 60 KB). The result is a short markdown breakdown of purpose, blockers, requested changes, failing CI, and next steps. Summaries are cached in `ai-summaries.json` per PR; a stale-SHA badge appears if the PR head has moved since the summary was generated, and there's a Regenerate button. PRs never generate summaries automatically — the CLI runs only when you click.
 
 Set `PR_DASHBOARD_AGENT=/path/to/agent` in the environment if the CLI lives somewhere unusual.
+
+## Team Review Filters
+
+The **To Review** page shows every open PR where either you or a team you belong to is on the reviewer list, with a compact filter row below the main nav:
+
+- **Assigned to me** (default) — only PRs where you're personally requested. This mirrors the previous default behavior.
+- One tab per team you belong to — PRs requested from that team. Tabs are generated from your actual GitHub memberships; nothing is hardcoded.
+- **All** — everything the review search returned, regardless of who's assigned.
+
+Each tab shows a live count. The current selection is remembered in `localStorage`, and if you leave a team the saved tab quietly falls back to *Assigned to me*. Empty states name the current filter so a blank list is obvious.
+
+Team memberships come from `gh api user/teams`, filtered to the organization that owns your configured repo. So if `config.json` points at `your-org/your-repo`, only `your-org` teams become tabs — memberships in unrelated organizations are never fetched into the UI. Matching is done on GitHub's `org/team` slug, which is also what appears in a PR's team review requests.
+
+This requires your CLI token to include the `read:org` scope. If your org is SAML-protected you may also need to authorize the token for it. If team loading fails, the direct filter keeps working and an inline error explains which auth step is missing — run `gh auth refresh -s read:org` (and follow any SSO prompt) if the team tabs don't appear.
 
 ## Cursor Chat Linking
 

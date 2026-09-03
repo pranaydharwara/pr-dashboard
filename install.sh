@@ -78,35 +78,63 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # authorised. Compiling also pins the grant to this bundle rather than to a
     # versioned Homebrew python path that changes on upgrade.
     mkdir -p "$HOME/Applications"
-    rm -rf "$APP" "$HOME/Applications/PR Dashboard Server.app"
-    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+    rm -rf "$HOME/Applications/PR Dashboard Server.app"
 
-    if ! cc -O2 -Wall -fobjc-arc -o "$APP_EXEC" "$SCRIPT_DIR/launcher.m" \
-        -DPRD_PYTHON="\"$PYTHON3_PATH\"" \
-        -DPRD_DIR="\"$SCRIPT_DIR\"" \
-        -DPRD_URL="\"http://localhost:${PORT}\"" \
-        -framework Cocoa -framework UserNotifications 2>/dev/null; then
-        echo "  ✗ Could not compile the launcher (need Xcode Command Line Tools)."
-        echo "    Run 'xcode-select --install' and re-run this script."
-        exit 1
+    # Re-signing changes the ad-hoc code signature, and macOS pins the
+    # Accessibility grant to that signature. Rebuilding a bundle that has not
+    # actually changed would silently revoke the grant while the toggle in
+    # System Settings still looks enabled. So only rebuild when an input
+    # differs from the one baked into the installed bundle.
+    BUILD_STAMP="$APP/Contents/Resources/.build-id"
+    BUILD_ID="$(
+        {
+            shasum -a 256 "$SCRIPT_DIR/launcher.m"
+            [ -f "$SCRIPT_DIR/icon.png" ] && shasum -a 256 "$SCRIPT_DIR/icon.png"
+            echo "$PYTHON3_PATH|$SCRIPT_DIR|$PORT"
+        } 2>/dev/null | shasum -a 256 | cut -d' ' -f1
+    )"
+
+    NEEDS_BUILD=1
+    if [ -x "$APP_EXEC" ] && [ -f "$BUILD_STAMP" ] \
+       && [ "$(cat "$BUILD_STAMP" 2>/dev/null)" = "$BUILD_ID" ] \
+       && codesign --verify "$APP" 2>/dev/null; then
+        NEEDS_BUILD=0
     fi
 
-    # Build the .icns from the bundled icon.png
-    if [ -f "$SCRIPT_DIR/icon.png" ]; then
-        ICONSET="$(mktemp -d)/icon.iconset"
-        mkdir -p "$ICONSET"
-        for spec in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
-                    "64 icon_32x32@2x" "128 icon_128x128" "256 icon_128x128@2x" \
-                    "256 icon_256x256" "512 icon_256x256@2x" "512 icon_512x512" \
-                    "1024 icon_512x512@2x"; do
-            sips -z "${spec% *}" "${spec% *}" "$SCRIPT_DIR/icon.png" \
-                --out "$ICONSET/${spec#* }.png" >/dev/null 2>&1
-        done
-        iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns" 2>/dev/null || true
-        rm -rf "$(dirname "$ICONSET")"
-    fi
+    if [ "$NEEDS_BUILD" -eq 0 ]; then
+        echo "  ✓ PR Dashboard.app is up to date (Accessibility grant preserved)"
+    else
+        APP_EXISTED=0
+        if [ -e "$APP" ]; then APP_EXISTED=1; fi
+        rm -rf "$APP"
+        mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-    cat > "$APP/Contents/Info.plist" << APPPLIST
+        if ! cc -O2 -Wall -fobjc-arc -o "$APP_EXEC" "$SCRIPT_DIR/launcher.m" \
+            -DPRD_PYTHON="\"$PYTHON3_PATH\"" \
+            -DPRD_DIR="\"$SCRIPT_DIR\"" \
+            -DPRD_URL="\"http://localhost:${PORT}\"" \
+            -framework Cocoa -framework UserNotifications 2>/dev/null; then
+            echo "  ✗ Could not compile the launcher (need Xcode Command Line Tools)."
+            echo "    Run 'xcode-select --install' and re-run this script."
+            exit 1
+        fi
+
+        # Build the .icns from the bundled icon.png
+        if [ -f "$SCRIPT_DIR/icon.png" ]; then
+            ICONSET="$(mktemp -d)/icon.iconset"
+            mkdir -p "$ICONSET"
+            for spec in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
+                        "64 icon_32x32@2x" "128 icon_128x128" "256 icon_128x128@2x" \
+                        "256 icon_256x256" "512 icon_256x256@2x" "512 icon_512x512" \
+                        "1024 icon_512x512@2x"; do
+                sips -z "${spec% *}" "${spec% *}" "$SCRIPT_DIR/icon.png" \
+                    --out "$ICONSET/${spec#* }.png" >/dev/null 2>&1
+            done
+            iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns" 2>/dev/null || true
+            rm -rf "$(dirname "$ICONSET")"
+        fi
+
+        cat > "$APP/Contents/Info.plist" << APPPLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -135,11 +163,24 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
 </plist>
 APPPLIST
 
-    # Use a stable designated requirement instead of the default ad-hoc cdhash.
-    # That keeps Accessibility approval attached across launcher rebuilds.
-    codesign --force --deep --sign - \
-        --requirements '=designated => identifier "com.prdashboard.app"' \
-        "$APP" 2>/dev/null || true
+        # Written before signing so the stamp is covered by the signature;
+        # adding it afterwards would invalidate the bundle.
+        printf '%s' "$BUILD_ID" > "$BUILD_STAMP"
+
+        # Ad-hoc signing has no cryptographic anchor, so macOS pins the
+        # Accessibility grant to this signature rather than to the stated
+        # designated requirement. Any re-sign therefore invalidates the grant.
+        codesign --force --deep --sign - \
+            --requirements '=designated => identifier "com.prdashboard.app"' \
+            "$APP" 2>/dev/null || true
+
+        if [ "$APP_EXISTED" -eq 1 ]; then
+            echo "  ! Rebuilt PR Dashboard.app — its Accessibility grant was reset."
+            echo "    Re-enable \"PR Dashboard\" under System Settings →"
+            echo "    Privacy & Security → Accessibility to restore chat linking."
+            tccutil reset Accessibility com.prdashboard.app >/dev/null 2>&1 || true
+        fi
+    fi
 
     # Create launchd agent (auto-starts on login, restarts on crash)
     mkdir -p "$HOME/Library/LaunchAgents"
