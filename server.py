@@ -14,7 +14,7 @@ import uuid
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
@@ -37,6 +37,7 @@ def load_config():
 
 CONFIG = load_config()
 REPO = CONFIG["repo"]
+REPO_OWNER = REPO.split("/")[0] if "/" in REPO else REPO
 PORT = CONFIG["port"]
 
 
@@ -86,7 +87,18 @@ CURSOR_STATE_DB = _cursor_global_storage_dir() / "state.vscdb"
 CURSOR_SEARCH_DB = _cursor_global_storage_dir() / "conversation-search.db"
 
 
-def open_cursor_session(title):
+APP_EXECUTABLE = (
+    Path.home() / "Applications" / "PR Dashboard.app" /
+    "Contents" / "MacOS" / "PR Dashboard"
+)
+
+ACCESSIBILITY_HINT = (
+    "Enable \"PR Dashboard\" under System Settings → Privacy & Security → "
+    "Accessibility, then click again."
+)
+
+
+def _open_cursor_session_via_osascript(title):
     safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
     tell application "Cursor" to activate
@@ -111,10 +123,7 @@ def open_cursor_session(title):
     stderr = (result.stderr or "").strip()
     if result.returncode != 0:
         if "1002" in stderr or "not allowed to send keystrokes" in stderr:
-            return (
-                "Enable \"PR Dashboard\" under System Settings → Privacy & "
-                "Security → Accessibility, then click again."
-            )
+            return ACCESSIBILITY_HINT
         if "-1743" in stderr or "Not authorised to send Apple events" in stderr:
             return (
                 "Enable \"PR Dashboard\" → System Events under System Settings → "
@@ -122,6 +131,34 @@ def open_cursor_session(title):
             )
         return stderr.splitlines()[-1] if stderr else "osascript failed"
     return None
+
+
+def open_cursor_session(title):
+    # Prefer the app bundle. It synthesises the keystrokes from the process
+    # launchd started, so macOS checks that bundle's own Accessibility grant.
+    # Driving osascript from here instead makes macOS attribute the request to
+    # the Python interpreter, which it will not persist a grant for.
+    if not APP_EXECUTABLE.exists():
+        return _open_cursor_session_via_osascript(title)
+
+    try:
+        result = subprocess.run(
+            [str(APP_EXECUTABLE), "--open-chat", title],
+            capture_output=True, text=True, timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        return "Cursor didn't respond in time"
+    except OSError as e:
+        return f"Failed to launch PR Dashboard helper: {e}"
+
+    if result.returncode == 0:
+        return None
+    if result.returncode == 3:
+        return ACCESSIBILITY_HINT
+    if result.returncode == 4:
+        return "Could not find or activate Cursor."
+    stderr = (result.stderr or "").strip()
+    return stderr.splitlines()[-1] if stderr else "Could not open the chat"
 
 
 def load_chat_links():
@@ -277,14 +314,10 @@ def save_alerts(alerts):
 
 
 def send_notification(title, body, alert_id):
-    app_executable = (
-        Path.home() / "Applications" / "PR Dashboard.app" /
-        "Contents" / "MacOS" / "PR Dashboard"
-    )
     notify_url = dashboard_url(f"/?alert={alert_id}")
-    if app_executable.exists():
+    if APP_EXECUTABLE.exists():
         subprocess.Popen(
-            [str(app_executable), "--notify", title, body, notify_url, alert_id],
+            [str(APP_EXECUTABLE), "--notify", title, body, notify_url, alert_id],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         return
@@ -603,36 +636,248 @@ def _watch_loop():
             pass
 
 
-def fetch_prs():
-    result = subprocess.run(
-        ["gh", "pr", "list", "--repo", REPO, "--author", "@me",
-         "--state", "open", "--json", PR_FIELDS, "--limit", "50"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return None
-    return json.loads(result.stdout)
+def _warm_cache():
+    # The review query is slow on large repos, so prime it at startup and
+    # keep it warm. The first page load then paints from cache instead of
+    # waiting on GitHub.
+    while True:
+        for fetch in (fetch_prs, fetch_review_requests_result):
+            try:
+                fetch()
+            except Exception:
+                pass
+        threading.Event().wait(_RESULT_FRESH)
 
 
-def fetch_review_requests():
-    result = subprocess.run(
-        ["gh", "pr", "list", "--repo", REPO,
-         "--search", "review-requested:@me state:open",
-         "--state", "open", "--json", PR_FIELDS, "--limit", "50"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return None
-    prs = json.loads(result.stdout)
-    if not GH_USERNAME:
-        return prs
-    return [
-        pr for pr in prs
-        if any(
-            r.get("__typename") == "User" and r.get("login") == GH_USERNAME
-            for r in pr.get("reviewRequests", [])
+_PR_FIELDS_LITE = ",".join(
+    f for f in PR_FIELDS.split(",") if f != "mergeStateStatus"
+)
+_PR_FIELDS_MIN = ",".join(
+    f for f in PR_FIELDS.split(",")
+    if f not in ("mergeStateStatus", "statusCheckRollup")
+)
+
+# An overloaded GraphQL query fails in many shapes: 502, 504, a cancelled
+# HTTP/2 stream, or a truncated body that gh reports as bad JSON. Enumerating
+# those is a losing game, so only genuine auth/config problems are treated as
+# fatal and everything else falls through to a lighter query.
+_FATAL_PATTERNS = (
+    "not logged into",
+    "gh auth login",
+    "authentication",
+    "bad credentials",
+    "http 401",
+    "requires authentication",
+    "must have admin rights",
+    "could not resolve to a repository",
+    "http 404",
+    "not found",
+    "no such host",
+    "unknown json field",
+    "unknown flag",
+)
+
+
+def _first_line(text):
+    text = (text or "").strip()
+    return text.splitlines()[-1] if text else "gh pr list failed"
+
+
+def _is_fatal(err):
+    low = (err or "").lower()
+    return any(p in low for p in _FATAL_PATTERNS)
+
+
+_PR_FIELD_TIERS = (PR_FIELDS, _PR_FIELDS_LITE, _PR_FIELDS_MIN)
+
+# Remembers the lightest field set that last worked for a given query so a
+# repo that reliably 502s on the richest tier doesn't pay two doomed ~10s
+# attempts on every refresh. Re-probed periodically in case GitHub recovers.
+_TIER_CACHE = {}
+_TIER_RETRY_AFTER = 30 * 60
+_TIER_LOCK = threading.Lock()
+
+
+def _tier_start(key):
+    with _TIER_LOCK:
+        entry = _TIER_CACHE.get(key)
+        if not entry:
+            return 0
+        idx, ts = entry
+        if time.time() - ts > _TIER_RETRY_AFTER:
+            _TIER_CACHE.pop(key, None)
+            return 0
+        return idx
+
+
+def _tier_remember(key, idx):
+    with _TIER_LOCK:
+        _TIER_CACHE[key] = (idx, time.time())
+
+
+def _gh_pr_list(extra_args, cache_key="default"):
+    # GitHub's GraphQL endpoint returns 502/504 when the heavier PR fields are
+    # requested for a large result set, so the query is tried in tiers: full,
+    # then without `mergeStateStatus`, then without `statusCheckRollup` too.
+    # A degraded row (no behind-base or CI badge) beats an empty dashboard.
+    def run_once(fields):
+        args = ["gh", "pr", "list", "--repo", REPO, "--state", "open",
+                "--json", fields, "--limit", "50"] + list(extra_args)
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=45)
+        except subprocess.TimeoutExpired:
+            return None
+
+    last_err = ""
+    for idx in range(_tier_start(cache_key), len(_PR_FIELD_TIERS)):
+        for attempt in range(2):
+            result = run_once(_PR_FIELD_TIERS[idx])
+            if result is None:
+                last_err = "gh pr list timed out"
+                continue
+            if result.returncode == 0:
+                try:
+                    data = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    # A truncated body means GitHub cut the response short;
+                    # treat it like any other overload and try a lighter tier.
+                    last_err = "GitHub returned an incomplete response"
+                    continue
+                _tier_remember(cache_key, idx)
+                return data, None
+            last_err = (result.stderr or result.stdout or "").strip()
+            if _is_fatal(last_err):
+                return None, _first_line(last_err)
+            time.sleep(0.6 * (attempt + 1))
+    return None, _first_line(last_err)
+
+
+# A large monorepo can take 30-60s to answer the review query, which would
+# otherwise be a blank spinner on every page load. Results are cached and
+# served stale while a background thread refreshes them.
+_RESULT_CACHE = {}
+_RESULT_CACHE_LOCK = threading.Lock()
+_RESULT_FRESH = 60
+_RESULT_REFRESHING = set()
+
+
+def _cached_fetch(key, fetcher, force=False):
+    now = time.time()
+    with _RESULT_CACHE_LOCK:
+        entry = _RESULT_CACHE.get(key)
+        refreshing = key in _RESULT_REFRESHING
+    if force:
+        # An explicit refresh must reflect actions the user just took, so it
+        # waits for live data instead of returning the cached snapshot.
+        data, err = fetcher()
+        if data is not None:
+            with _RESULT_CACHE_LOCK:
+                _RESULT_CACHE[key] = (data, time.time(), None)
+            return data, None
+        if entry:
+            return entry[0], None
+        return None, err
+    if entry:
+        data, ts, err = entry
+        if now - ts < _RESULT_FRESH:
+            return data, err
+        if not refreshing:
+            with _RESULT_CACHE_LOCK:
+                _RESULT_REFRESHING.add(key)
+
+            def revalidate():
+                try:
+                    fresh, ferr = fetcher()
+                    if fresh is not None:
+                        with _RESULT_CACHE_LOCK:
+                            _RESULT_CACHE[key] = (fresh, time.time(), None)
+                finally:
+                    with _RESULT_CACHE_LOCK:
+                        _RESULT_REFRESHING.discard(key)
+
+            threading.Thread(target=revalidate, daemon=True).start()
+        return data, err
+    data, err = fetcher()
+    if data is not None:
+        with _RESULT_CACHE_LOCK:
+            _RESULT_CACHE[key] = (data, time.time(), None)
+    return data, err
+
+
+def invalidate_pr_cache():
+    with _RESULT_CACHE_LOCK:
+        _RESULT_CACHE.clear()
+
+
+def fetch_prs_result(force=False):
+    return _cached_fetch(
+        "mine", lambda: _gh_pr_list(["--author", "@me"], cache_key="mine"),
+        force=force)
+
+
+def fetch_prs(force=False):
+    data, _err = fetch_prs_result(force=force)
+    return data
+
+
+def fetch_review_requests(force=False):
+    data, _err = fetch_review_requests_result(force=force)
+    return data
+
+
+def fetch_review_requests_result(force=False):
+    # Returns both direct and team-requested PRs. The frontend filters
+    # between "Assigned to me" and individual team tabs client-side using
+    # the reviewRequests array embedded in each PR, so widening this fetch
+    # unlocks team views without spending another gh request per tab switch.
+    return _cached_fetch("review", lambda: _gh_pr_list(
+        ["--search", "review-requested:@me state:open"], cache_key="review"),
+        force=force)
+
+
+def fetch_user_teams():
+    # `user/teams` spans every org the token can see, so results are narrowed
+    # to the configured repo's owner. Without that, pointing the dashboard at
+    # one repo would surface team names from unrelated organizations.
+    try:
+        result = subprocess.run(
+            ["gh", "api", "user/teams", "--paginate"],
+            capture_output=True, text=True, timeout=15,
         )
-    ]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, f"gh api user/teams failed: {e}"
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        last = err.splitlines()[-1] if err else "gh api user/teams failed"
+        if "read:org" in err.lower() or "scope" in err.lower():
+            return None, (
+                "GitHub token is missing the read:org scope. Run "
+                "`gh auth refresh -s read:org` and reload."
+            )
+        return None, last
+    try:
+        raw = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as e:
+        return None, f"Could not parse teams response: {e}"
+    owner = REPO_OWNER.lower()
+    seen = set()
+    teams = []
+    for entry in raw:
+        slug = (entry.get("slug") or "").strip()
+        org = ((entry.get("organization") or {}).get("login") or "").strip()
+        if not slug or not org or org.lower() != owner:
+            continue
+        full = f"{org}/{slug}"
+        if full in seen:
+            continue
+        seen.add(full)
+        teams.append({
+            "slug": full,
+            "name": entry.get("name") or slug,
+            "org": org,
+        })
+    teams.sort(key=lambda t: t["name"].lower())
+    return teams, None
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -688,6 +933,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
   .nav a:hover { background: var(--gray-bg); color: var(--text); }
   .nav a.active { background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue-border); }
+
+  /* Sub-nav filter bar */
+  .filter-bar {
+    display: flex; flex-wrap: wrap; gap: 4px; margin: -12px 0 24px;
+    align-items: center;
+  }
+  .filter-chip {
+    padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
+    background: transparent; color: var(--text2); border: 1px solid var(--border);
+    cursor: pointer; transition: all 0.15s; font-family: inherit;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .filter-chip:hover { background: var(--bg-hover); color: var(--text); }
+  .filter-chip.active {
+    background: var(--blue-bg); color: var(--blue); border-color: var(--blue-border);
+  }
+  .filter-chip-count {
+    font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 10px;
+    background: var(--gray-bg); color: var(--text3); min-width: 16px; text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .filter-chip.active .filter-chip-count {
+    background: var(--blue); color: #fff;
+  }
+  .filter-chip:disabled { cursor: default; opacity: 0.5; }
+  .filter-error {
+    font-size: 11px; color: var(--red); padding-left: 8px;
+  }
+  .filter-empty {
+    padding: 40px 20px; text-align: center; color: var(--text3);
+    font-size: 13px; background: var(--bg-card);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
 
   /* Header */
   .header { margin-bottom: 20px; }
@@ -1110,7 +1389,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="refresh-info" id="refresh-info">
           <span class="live-dot"></span>
           <span id="refresh-text">Loading...</span>
-          <button class="btn-refresh" onclick="refresh()">Refresh</button>
+          <button class="btn-refresh" onclick="refresh(true)">Refresh</button>
         </div>
       </div>
     </div>
@@ -1120,6 +1399,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <a href="/" class="active">My PRs</a>
     <a href="/review">To Review</a>
   </nav>
+  <div id="filter-bar"></div>
   <div id="content"><div id="loading"><div class="spinner"></div>Fetching pull requests...</div></div>
 
 <script>
@@ -1220,8 +1500,10 @@ function ageHtml(days) {
 
 function render(prs) {
   currentPrs = prs;
+  renderFilterBar(prs);
+  const visible = isReviewPage ? prs.filter(prMatchesReviewFilter) : prs;
   const approved = [], needsReview = [], drafts = [];
-  for (const pr of prs) {
+  for (const pr of visible) {
     const [ciStatus, ciFailures] = classifyCi(pr.statusCheckRollup);
     pr._ci = ciStatus; pr._ciF = ciFailures;
     pr._age = ageDays(pr.createdAt);
@@ -1240,9 +1522,9 @@ function render(prs) {
   }
   [approved, needsReview, drafts].forEach(a => a.sort((a, b) => a._age - b._age));
 
-  const total = prs.length;
+  const total = visible.length;
   const nApproved = approved.length;
-  const nFailing = prs.filter(p => p._ci === 'failing').length;
+  const nFailing = visible.filter(p => p._ci === 'failing').length;
   const nDraft = drafts.length;
 
   function watchBtnHtml(prNum) {
@@ -1378,14 +1660,22 @@ function render(prs) {
     }
   }
 
-  document.getElementById('content').innerHTML = `
-    <div class="stats">
-      <div class="stat"><div class="num">${total}</div><div class="label">Open PRs</div></div>
-      <div class="stat"><div class="num" style="color:var(--green);">${nApproved}</div><div class="label">Approved</div></div>
-      <div class="stat"><div class="num" style="color:var(--red);">${nFailing}</div><div class="label">CI Failing</div></div>
-      <div class="stat"><div class="num" style="color:var(--purple);">${nDraft}</div><div class="label">Drafts</div></div>
-    </div>
-    <div class="table-card">
+  const emptyMessage = (isReviewPage && total === 0) ? (() => {
+    if (reviewFilter === 'direct') return 'No open PRs are waiting on your review.';
+    if (reviewFilter === 'all') return 'No open PRs match this view.';
+    if (reviewFilter.startsWith('team:')) {
+      const slug = reviewFilter.slice(5);
+      const team = reviewTeams.find(t => t.slug === slug);
+      return team
+        ? `No open PRs are waiting on ${team.name}.`
+        : 'No open PRs match this team.';
+    }
+    return 'No matching PRs.';
+  })() : '';
+
+  const tableHtml = (isReviewPage && total === 0)
+    ? `<div class="filter-empty">${escapeHtml(emptyMessage)}</div>`
+    : `<div class="table-card">
       <table class="pr-table">
         <thead><tr>
           <th></th><th>Pull Request</th><th>Review</th><th>CI</th><th>Merge</th><th style="text-align:right;">Age</th><th style="text-align:right;">Size</th>
@@ -1393,6 +1683,15 @@ function render(prs) {
         <tbody>${tableRows}</tbody>
       </table>
     </div>`;
+
+  document.getElementById('content').innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="num">${total}</div><div class="label">Open PRs</div></div>
+      <div class="stat"><div class="num" style="color:var(--green);">${nApproved}</div><div class="label">Approved</div></div>
+      <div class="stat"><div class="num" style="color:var(--red);">${nFailing}</div><div class="label">CI Failing</div></div>
+      <div class="stat"><div class="num" style="color:var(--purple);">${nDraft}</div><div class="label">Drafts</div></div>
+    </div>
+    ${tableHtml}`;
 
   initDragAndDrop();
 }
@@ -1466,8 +1765,105 @@ let alerts = [];
 let alertPanelOpenedFromUrl = false;
 let aiSummaries = {};
 let currentPrs = [];
+let reviewTeams = [];
+let reviewTeamsError = '';
+let reviewFilter = localStorage.getItem('review-filter') || 'direct';
+let ghLogin = '';
 const aiPending = new Set();
 const updatePending = new Set();
+
+async function loadTeams() {
+  if (!isReviewPage) return;
+  try {
+    const res = await fetch('/api/teams');
+    const data = await res.json();
+    reviewTeams = Array.isArray(data.teams) ? data.teams : [];
+    reviewTeamsError = data.ok === false ? (data.error || 'Could not load teams') : '';
+  } catch (e) {
+    reviewTeams = [];
+    reviewTeamsError = 'Could not load teams';
+  }
+  // If the persisted selection is a team the user no longer belongs to,
+  // fall back to the default rather than showing an empty view forever.
+  if (reviewFilter.startsWith('team:')) {
+    const wanted = reviewFilter.slice(5);
+    if (!reviewTeams.some(t => t.slug === wanted)) {
+      reviewFilter = 'direct';
+      localStorage.removeItem('review-filter');
+    }
+  }
+}
+
+async function loadMe() {
+  if (!isReviewPage) return;
+  try {
+    const res = await fetch('/api/me');
+    const data = await res.json();
+    ghLogin = data.login || '';
+  } catch (e) { ghLogin = ''; }
+}
+
+function prMatchesReviewFilter(pr) {
+  const reqs = pr.reviewRequests || [];
+  if (reviewFilter === 'all') return true;
+  if (reviewFilter === 'direct') {
+    if (!ghLogin) return true;
+    return reqs.some(r => r.__typename === 'User' && r.login === ghLogin);
+  }
+  if (reviewFilter.startsWith('team:')) {
+    const slug = reviewFilter.slice(5);
+    return reqs.some(r => r.__typename === 'Team' && r.slug === slug);
+  }
+  return true;
+}
+
+function countMatches(prs, filter) {
+  const saved = reviewFilter;
+  reviewFilter = filter;
+  let n = 0;
+  for (const pr of prs) { if (prMatchesReviewFilter(pr)) n++; }
+  reviewFilter = saved;
+  return n;
+}
+
+function setReviewFilter(value) {
+  if (reviewFilter === value) return;
+  reviewFilter = value;
+  if (value === 'direct') localStorage.removeItem('review-filter');
+  else localStorage.setItem('review-filter', value);
+  render(currentPrs);
+}
+
+function renderFetchError(message) {
+  const bar = document.getElementById('filter-bar');
+  if (bar) bar.innerHTML = '';
+  document.getElementById('content').innerHTML =
+    `<div class="filter-empty">
+       <div style="font-weight:700;color:var(--red);margin-bottom:6px;">Couldn't load pull requests</div>
+       <div>${escapeHtml(message || 'GitHub did not respond in time.')}</div>
+       <div style="margin-top:10px;font-size:12px;">Retrying automatically. GitHub's API sometimes times out on large review queries.</div>
+     </div>`;
+}
+
+function renderFilterBar(prs) {
+  const bar = document.getElementById('filter-bar');
+  if (!bar) return;
+  if (!isReviewPage) { bar.innerHTML = ''; return; }
+  const chips = [];
+  chips.push({key: 'direct', label: 'Assigned to me'});
+  for (const t of reviewTeams) {
+    chips.push({key: 'team:' + t.slug, label: t.name});
+  }
+  chips.push({key: 'all', label: 'All'});
+  const html = chips.map(c => {
+    const count = countMatches(prs, c.key);
+    const active = c.key === reviewFilter ? ' active' : '';
+    return `<button class="filter-chip${active}" onclick="setReviewFilter('${c.key.replace(/'/g, "\\'")}')">${escapeHtml(c.label)}<span class="filter-chip-count">${count}</span></button>`;
+  }).join('');
+  const err = reviewTeamsError
+    ? `<span class="filter-error">${escapeHtml(reviewTeamsError)}</span>` : '';
+  bar.innerHTML = html + err;
+}
 
 async function loadAiSummaries() {
   try {
@@ -1953,31 +2349,53 @@ async function saveChatLink(prNum, url, title, id) {
   refresh();
 }
 
-async function refresh() {
+let refreshInFlight = false;
+
+// force=true bypasses the server cache so a manual click reflects actions the
+// user just took on GitHub. It costs a live API round-trip, so the periodic
+// timer leaves it off and takes whatever the background refresh has cached.
+async function refresh(force = false) {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   const info = document.getElementById('refresh-info');
   const text = document.getElementById('refresh-text');
+  const btn = document.querySelector('.btn-refresh');
   info.classList.add('loading');
-  text.textContent = 'Refreshing...';
+  text.textContent = force ? 'Fetching latest from GitHub...' : 'Refreshing...';
+  if (btn) { btn.disabled = true; btn.textContent = 'Refreshing'; }
   try {
-    await Promise.all([loadChatLinks(), loadWatches(), loadAlerts(), loadAiSummaries()]);
-    const res = await fetch(isReviewPage ? '/api/review' : '/api/prs');
-    const prs = await res.json();
-    render(prs);
+    await Promise.all([
+      loadChatLinks(), loadWatches(), loadAlerts(), loadAiSummaries(),
+      loadTeams(), loadMe(),
+    ]);
+    const base = isReviewPage ? '/api/review' : '/api/prs';
+    const res = await fetch(base + (force ? '?fresh=1' : ''));
+    const payload = await res.json();
+    if (!Array.isArray(payload)) {
+      // GitHub's GraphQL API can time out on large queries; say so rather
+      // than rendering an empty table that looks like "nothing to review".
+      renderFetchError(payload && payload.error);
+      text.textContent = 'GitHub error — retrying in 5m';
+      return;
+    }
+    render(payload);
     if (!alertPanelOpenedFromUrl && new URLSearchParams(location.search).has('alert')) {
       alertPanelOpenedFromUrl = true;
       showAlerts();
     }
     const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     text.textContent = `Updated ${now} · next in 5m`;
-    info.classList.remove('loading');
   } catch (e) {
     text.textContent = 'Fetch failed — retrying in 5m';
+  } finally {
     info.classList.remove('loading');
+    if (btn) { btn.disabled = false; btn.textContent = 'Refresh'; }
+    refreshInFlight = false;
   }
 }
 
 refresh();
-setInterval(refresh, REFRESH_INTERVAL);
+setInterval(() => refresh(), REFRESH_INTERVAL);
 </script>
 </body>
 </html>""".replace("__REPO__", REPO)
@@ -2035,11 +2453,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        force = parse_qs(parsed.query).get("fresh", ["0"])[0] == "1"
         if path == "/api/prs":
-            self._json_response(fetch_prs() or [])
+            data, err = fetch_prs_result(force=force)
+            if data is None:
+                self._json_response({"error": err or "Could not load pull requests"})
+            else:
+                self._json_response(data)
         elif path == "/api/review":
-            self._json_response(fetch_review_requests() or [])
+            data, err = fetch_review_requests_result(force=force)
+            if data is None:
+                self._json_response({"error": err or "Could not load review requests"})
+            else:
+                self._json_response(data)
         elif path == "/api/sessions":
             self._json_response(scan_cursor_sessions())
         elif path == "/api/chat-links":
@@ -2050,6 +2478,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(list(reversed(load_alerts())))
         elif path == "/api/ai-summaries":
             self._json_response(load_ai_summaries())
+        elif path == "/api/teams":
+            teams, err = fetch_user_teams()
+            if err:
+                self._json_response({"ok": False, "error": err, "teams": []})
+            else:
+                self._json_response({"ok": True, "teams": teams})
+        elif path == "/api/me":
+            self._json_response({"login": GH_USERNAME or ""})
         elif path == "/icon.png":
             if ICON_PATH.exists():
                 self._binary_response(ICON_PATH, "image/png")
@@ -2125,6 +2561,7 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 self._json_response({"ok": False, "error": err})
                 return
+            invalidate_pr_cache()
             self._json_response(result)
         elif path == "/api/pr/ai-summary":
             length = int(self.headers.get("Content-Length", 0))
@@ -2194,6 +2631,8 @@ def main():
 
     watcher = threading.Thread(target=_watch_loop, daemon=True)
     watcher.start()
+
+    threading.Thread(target=_warm_cache, daemon=True).start()
 
     server = HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"PR Dashboard running at {dashboard_url()}")
